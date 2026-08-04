@@ -8,6 +8,7 @@ type NotificationPayload = Parameters<DesktopBridge['notify']>[0]
 const noop = () => undefined
 const off = () => noop
 const ok = async () => ({ ok: true })
+const home = '/home/rpw'
 
 function apiUrl(path: string, profile?: string): string {
   const url = new URL(path, window.location.origin)
@@ -84,6 +85,7 @@ const bridge = new Proxy(
     onConnectionApplied: off,
     onPowerResume: off,
     onPreviewFileChanged: off,
+    onWindowStateChanged: off,
     openExternal: async (url: string) => void window.open(url, '_blank', 'noopener,noreferrer'),
     openPreviewInBrowser: async (url: string) => void window.open(url, '_blank', 'noopener,noreferrer'),
     writeClipboard: async (text: string) => {
@@ -100,6 +102,8 @@ const bridge = new Proxy(
     },
     requestMicrophoneAccess: async () => true,
     profile: { get: async () => ({ profile: null }), set: async (profile: string | null) => ({ profile }) },
+    settings: { getDefaultProjectDir: async () => ({ dir: home }) },
+    sanitizeWorkspaceCwd: async (cwd?: string) => ({ cwd: cwd || home, sanitized: false }),
     setActiveWork: noop,
     setKeepAwake: noop,
     setNativeTheme: noop,
