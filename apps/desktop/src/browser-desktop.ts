@@ -1,5 +1,10 @@
 import { buildHermesWebSocketUrl } from '@hermes/shared'
 
+type DesktopBridge = Window['hermesDesktop']
+type ApiRequest = Parameters<DesktopBridge['api']>[0]
+type Connection = Awaited<ReturnType<DesktopBridge['getConnection']>>
+type NotificationPayload = Parameters<DesktopBridge['notify']>[0]
+
 const noop = () => undefined
 const off = () => noop
 const ok = async () => ({ ok: true })
@@ -10,7 +15,7 @@ function apiUrl(path: string, profile?: string): string {
   return url.toString()
 }
 
-async function api<T>(request: HermesApiRequest): Promise<T> {
+async function api<T>(request: ApiRequest): Promise<T> {
   const headers = new Headers()
   let body: BodyInit | undefined
 
@@ -43,7 +48,7 @@ async function api<T>(request: HermesApiRequest): Promise<T> {
 }
 
 const baseUrl = window.location.origin
-const connection: HermesConnection = {
+const connection: Connection = {
   baseUrl,
   isFullscreen: false,
   mode: 'local',
@@ -83,7 +88,7 @@ const bridge = new Proxy(
     },
     readClipboard: () => navigator.clipboard.readText(),
     getPathForFile: () => '',
-    notify: async (payload: HermesNotification) => {
+    notify: async (payload: NotificationPayload) => {
       if (Notification.permission === 'granted') new Notification(payload.title ?? 'Hermes', { body: payload.body })
       return true
     },
@@ -100,6 +105,6 @@ const bridge = new Proxy(
   { get: (target, key) => Reflect.get(target, key) ?? unsupported }
 )
 
-if (!window.hermesDesktop) window.hermesDesktop = bridge as Window['hermesDesktop']
+if (!window.hermesDesktop) window.hermesDesktop = bridge as unknown as DesktopBridge
 
 export { apiUrl }
