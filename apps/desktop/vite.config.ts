@@ -217,10 +217,24 @@ export default defineConfig(({ command }) => ({
     strictPort: true,
     fs: {
       allow: fsAllow
+    },
+    // Browser renderer development stays same-origin while `hermes serve` owns
+    // the real API and gateway socket on loopback.
+    proxy: {
+      '/api': {
+        target: process.env.HERMES_WEB_BACKEND ?? 'http://127.0.0.1:9119',
+        ws: true
+      }
     }
   },
   preview: {
     host: '127.0.0.1',
-    port: 4174
+    port: 4174,
+    proxy: {
+      '/api': {
+        target: process.env.HERMES_WEB_BACKEND ?? 'http://127.0.0.1:9119',
+        ws: true
+      }
+    }
   }
 }))

@@ -1,4 +1,7 @@
 import './styles.css'
+// The browser build has no Electron preload; install the same narrow renderer
+// capability seam against the dashboard's same-origin HTTP/WebSocket API.
+import './browser-desktop'
 // Side-effect: reports in-flight turns to the main process for the quit guard.
 import './store/active-work'
 // Side-effect: mirrors the machine's AC/battery state for poll demotion.

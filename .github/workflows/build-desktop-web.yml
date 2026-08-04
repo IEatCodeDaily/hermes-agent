@@ -1,0 +1,33 @@
+name: Build Hermes Desktop Web
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [terminus/hermes-desktop-web]
+    paths:
+      - apps/desktop/**
+      - apps/shared/**
+      - package.json
+      - package-lock.json
+      - .github/workflows/build-desktop-web.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: npm
+      - run: npm ci
+      - run: npm run check:browser-adapter --workspace=apps/desktop
+      - run: npm run typecheck --workspace=apps/desktop
+      - run: npm run lint --workspace=apps/desktop
+      - run: npm run test:ui --workspace=apps/desktop
+      - run: npm run build --workspace=apps/desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-desktop-web
+          path: apps/desktop/dist
+          if-no-files-found: error

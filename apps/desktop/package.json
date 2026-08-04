@@ -61,6 +61,7 @@
     "lint:fix": "eslint src/ electron/ --fix",
     "fmt": "prettier --write 'src/**/*.{ts,tsx}' 'electron/**/*.ts' 'vite.config.ts'",
     "fix": "npm run lint:fix && npm run fmt",
+    "check:browser-adapter": "node scripts/check-browser-adapter.mjs",
     "test:ui": "vitest run --project ui",
     "test:desktop:platforms": "vitest run --project electron",
     "test:find-in-page-native": "electron electron/find-in-page-native-fixture",
