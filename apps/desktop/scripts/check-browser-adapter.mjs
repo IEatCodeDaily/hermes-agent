@@ -11,6 +11,6 @@ const [entry, adapter, vite] = await Promise.all([
 assert.match(entry, /import ['"]\.\/browser-desktop['"]/)
 assert.match(adapter, /fetch\(apiUrl\(request\.path, request\.profile \?\? undefined\)/)
 assert.match(adapter, /buildHermesWebSocketUrl\(\{ path: ['"]\/api\/ws['"] \}\)/)
-assert.match(adapter, /if \(!window\.hermesDesktop\) window\.hermesDesktop = bridge/)
+assert.match(adapter, /if \(!window\.hermesDesktop\) \{\s*window\.hermesDesktop = bridge/)
 assert.match(vite, /['"]\/api['"]:\s*\{[\s\S]*?ws: true/)
 console.log('browser adapter check: ok')

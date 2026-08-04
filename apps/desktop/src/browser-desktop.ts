@@ -11,7 +11,9 @@ const ok = async () => ({ ok: true })
 
 function apiUrl(path: string, profile?: string): string {
   const url = new URL(path, window.location.origin)
-  if (profile && !url.searchParams.has('profile')) url.searchParams.set('profile', profile)
+  if (profile && !url.searchParams.has('profile')) {
+    url.searchParams.set('profile', profile)
+  }
   return url.toString()
 }
 
@@ -40,7 +42,9 @@ async function api<T>(request: ApiRequest): Promise<T> {
       signal: controller.signal
     })
     const text = await response.text()
-    if (!response.ok) throw new Error(`${response.status}: ${text || response.statusText}`)
+    if (!response.ok) {
+      throw new Error(`${response.status}: ${text || response.statusText}`)
+    }
     return (text ? JSON.parse(text) : {}) as T
   } finally {
     window.clearTimeout(timeout)
@@ -89,7 +93,9 @@ const bridge = new Proxy(
     readClipboard: () => navigator.clipboard.readText(),
     getPathForFile: () => '',
     notify: async (payload: NotificationPayload) => {
-      if (Notification.permission === 'granted') new Notification(payload.title ?? 'Hermes', { body: payload.body })
+      if (Notification.permission === 'granted') {
+        new Notification(payload.title ?? 'Hermes', { body: payload.body })
+      }
       return true
     },
     requestMicrophoneAccess: async () => true,
@@ -105,6 +111,8 @@ const bridge = new Proxy(
   { get: (target, key) => Reflect.get(target, key) ?? unsupported }
 )
 
-if (!window.hermesDesktop) window.hermesDesktop = bridge as unknown as DesktopBridge
+if (!window.hermesDesktop) {
+  window.hermesDesktop = bridge as unknown as DesktopBridge
+}
 
 export { apiUrl }
