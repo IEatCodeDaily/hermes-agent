@@ -32,7 +32,7 @@ async function api<T>(request: ApiRequest): Promise<T> {
   const timeout = window.setTimeout(() => controller.abort(), request.timeoutMs ?? 30_000)
 
   try {
-    const response = await fetch(apiUrl(request.path, request.profile), {
+    const response = await fetch(apiUrl(request.path, request.profile ?? undefined), {
       body,
       credentials: 'same-origin',
       headers,
