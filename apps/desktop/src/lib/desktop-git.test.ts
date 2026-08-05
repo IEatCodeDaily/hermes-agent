@@ -58,7 +58,7 @@ describe('desktop git facade', () => {
 
   it('normalizes a missing remote ship-info response', async () => {
     $connection.set({ mode: 'remote' } as never)
-    api.mockResolvedValueOnce(undefined)
+    api.mockResolvedValueOnce(undefined as never)
 
     await expect(desktopGit()?.review.shipInfo('/work')).resolves.toEqual({ ghReady: false, pr: null })
   })
