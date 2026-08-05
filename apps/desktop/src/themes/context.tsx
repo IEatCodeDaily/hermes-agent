@@ -50,7 +50,7 @@ const resolveMode = (mode: ThemeMode, systemDark = matchesQuery('(prefers-color-
   mode === 'system' ? (systemDark ? 'dark' : 'light') : mode
 
 const normalizeSkin = (name: string | null): string =>
-  name && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
+  name && resolveTheme(name) && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
 
 /**
  * A stored mode, or `system` when there isn't one.
@@ -84,6 +84,14 @@ export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
 
 /** Everything a peer window could change that this one has to repaint for. */
 const APPEARANCE_KEYS = new Set([SKIN_KEY, PROFILE_SKINS_KEY, MODE_KEY, PROFILE_MODES_KEY])
+
+// Theme plugins/backend skins register after module boot. Preserve the stored
+// name for first paint; deriveTheme safely falls back until the registry arrives.
+const resolveBootSkin = (profile: string): string => {
+  const name = storedStringRecord(PROFILE_SKINS_KEY)[profile] ?? storedString(SKIN_KEY)
+
+  return name && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
+}
 
 // Last active profile — lets the boot paint pick its appearance before the
 // gateway reports which profile actually launched.
@@ -299,7 +307,7 @@ if (typeof window !== 'undefined') {
   const profile = readBootProfileKey()
   const pref = modePref.resolve(profile)
   const resolved = resolveMode(pref)
-  const theme = deriveTheme(skinPref.resolve(profile), resolved)
+  const theme = deriveTheme(resolveBootSkin(profile), resolved)
   applyTheme(theme, resolved)
   syncNativeTheme(pref, renderedModeFor(theme.colors, resolved))
 }
@@ -372,7 +380,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   )
 
   const [themeName, setThemeNameState] = useState(() =>
-    typeof window === 'undefined' ? DEFAULT_SKIN_NAME : skinPref.resolve(readBootProfileKey())
+    typeof window === 'undefined' ? DEFAULT_SKIN_NAME : resolveBootSkin(readBootProfileKey())
   )
 
   const [mode, setModeState] = useState<ThemeMode>(() =>
@@ -383,7 +391,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // remember it for the next boot's first paint.
   useEffect(() => {
     rememberActiveProfileKey(profileKey)
-    setThemeNameState(skinPref.resolve(profileKey))
+    setThemeNameState(resolveBootSkin(profileKey))
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
