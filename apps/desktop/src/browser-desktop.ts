@@ -56,7 +56,7 @@ const baseUrl = window.location.origin
 const connection: Connection = {
   baseUrl,
   isFullscreen: false,
-  mode: 'local',
+  mode: 'remote',
   authMode: 'oauth',
   nativeOverlayWidth: 0,
   token: '',
