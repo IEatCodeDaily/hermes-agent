@@ -64,6 +64,25 @@ const connection: Connection = {
   logs: [],
   windowButtonPosition: null
 }
+const terminals = new Map<string, { data: Set<(value: string) => void>; exit: Set<(value: { exitCode: number; signal?: number }) => void>; socket: WebSocket }>()
+const terminal = {
+  cwd: async () => home,
+  dispose: async (id: string) => (terminals.get(id)?.socket.close(), terminals.delete(id)),
+  onData: (id: string, callback: (value: string) => void) => (terminals.get(id)?.data.add(callback), () => terminals.get(id)?.data.delete(callback)),
+  onExit: (id: string, callback: (value: { exitCode: number; signal?: number }) => void) => (terminals.get(id)?.exit.add(callback), () => terminals.get(id)?.exit.delete(callback)),
+  resize: async () => true,
+  start: async () => {
+    const id = crypto.randomUUID()
+    const socket = new WebSocket(`${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/terminal`)
+    const session = { data: new Set<(value: string) => void>(), exit: new Set<(value: { exitCode: number; signal?: number }) => void>(), socket }
+    terminals.set(id, session)
+    socket.onmessage = event => session.data.forEach(callback => callback(String(event.data)))
+    socket.onclose = () => session.exit.forEach(callback => callback({ exitCode: 0 }))
+    await new Promise<void>((resolve, reject) => { socket.onopen = () => resolve(); socket.onerror = () => reject(new Error('Terminal connection failed')) })
+    return { id, shell: 'shell' }
+  },
+  write: async (id: string, data: string) => (terminals.get(id)?.socket.send(data), true)
+}
 
 const unsupported = new Proxy(noop, {
   apply: () => Promise.resolve(undefined),
@@ -103,6 +122,7 @@ const bridge = new Proxy(
     requestMicrophoneAccess: async () => true,
     profile: { get: async () => ({ profile: null }), set: async (profile: string | null) => ({ profile }) },
     settings: { getDefaultProjectDir: async () => ({ dir: home }) },
+    terminal,
     sanitizeWorkspaceCwd: async (cwd?: string) => ({ cwd: cwd || home, sanitized: false }),
     setActiveWork: noop,
     setKeepAwake: noop,
