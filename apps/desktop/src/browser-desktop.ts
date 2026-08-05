@@ -115,7 +115,9 @@ const bridge = new Proxy(
   {
     get: (target, key) => {
       const value = Reflect.get(target, key)
-      if (value !== undefined) return value
+      if (value !== undefined) {
+        return value
+      }
       return typeof key === 'string' && key.startsWith('on') ? off : unsupported
     }
   }
