@@ -112,7 +112,13 @@ const bridge = new Proxy(
     setTranslucency: noop,
     signalDeepLinkReady: ok
   },
-  { get: (target, key) => Reflect.get(target, key) ?? unsupported }
+  {
+    get: (target, key) => {
+      const value = Reflect.get(target, key)
+      if (value !== undefined) return value
+      return typeof key === 'string' && key.startsWith('on') ? off : unsupported
+    }
+  }
 )
 
 if (!window.hermesDesktop) {
