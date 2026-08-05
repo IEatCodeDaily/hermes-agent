@@ -50,7 +50,7 @@ const resolveMode = (mode: ThemeMode, systemDark = matchesQuery('(prefers-color-
   mode === 'system' ? (systemDark ? 'dark' : 'light') : mode
 
 const normalizeSkin = (name: string | null): string =>
-  name && resolveTheme(name) && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
+  name && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
 
 /**
  * A stored mode, or `system` when there isn't one.
