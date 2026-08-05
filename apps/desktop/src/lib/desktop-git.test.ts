@@ -56,6 +56,13 @@ describe('desktop git facade', () => {
     expect(api).not.toHaveBeenCalled()
   })
 
+  it('normalizes a missing remote ship-info response', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    api.mockResolvedValueOnce(undefined)
+
+    await expect(desktopGit()?.review.shipInfo('/work')).resolves.toEqual({ ghReady: false, pr: null })
+  })
+
   it('routes reads through the backend REST mirror on a remote gateway', async () => {
     $connection.set({ mode: 'remote' } as never)
 

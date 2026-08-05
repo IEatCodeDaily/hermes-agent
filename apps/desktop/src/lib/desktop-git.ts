@@ -91,7 +91,11 @@ const remoteGit: GitBridge = {
 
     push: repoPath => gitPost('review/push', { path: repoPath }),
 
-    shipInfo: repoPath => gitGet<HermesReviewShipInfo>('review/ship-info', { path: repoPath }),
+    shipInfo: async repoPath =>
+      (await gitGet<HermesReviewShipInfo | undefined>('review/ship-info', { path: repoPath })) ?? {
+        ghReady: false,
+        pr: null
+      },
 
     prList: (repoPath, branches, numbers) =>
       gitPost<HermesRepoPullRequests>('review/pr-list', { branches, numbers: numbers ?? [], path: repoPath }),
