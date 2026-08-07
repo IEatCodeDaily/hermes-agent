@@ -468,6 +468,15 @@ describe('refreshShipInfo', () => {
     expect($reviewShipInfo.get()).toEqual(info)
   })
 
+  it('resets ship info when the bridge returns no payload', async () => {
+    stubReview({ shipInfo: vi.fn(async () => undefined as never) })
+    $reviewShipInfo.set({ ghReady: true, pr: { url: 'x' } } as HermesReviewShipInfo)
+
+    await refreshShipInfo()
+
+    expect($reviewShipInfo.get()).toEqual({ ghReady: false, pr: null })
+  })
+
   it('resets ship info when there is no bridge', async () => {
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
     $reviewShipInfo.set({ ghReady: true, pr: { url: 'x' } } as HermesReviewShipInfo)

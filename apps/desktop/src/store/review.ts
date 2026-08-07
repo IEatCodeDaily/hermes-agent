@@ -244,7 +244,7 @@ export async function refreshShipInfo(): Promise<void> {
     const info = await ctx.review.shipInfo(ctx.cwd)
 
     if (seq === shipInfoSeq && repoCwd() === ctx.cwd) {
-      $reviewShipInfo.set(info)
+      $reviewShipInfo.set(info ?? { ghReady: false, pr: null })
       shipInfoLastCheckedAt = Date.now()
     }
   } catch {
