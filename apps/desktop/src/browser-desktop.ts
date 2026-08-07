@@ -10,6 +10,19 @@ const off = () => noop
 const ok = async () => ({ ok: true })
 const home = '/home/rpw'
 
+const imageMime = (ext: string) =>
+  ({ '.bmp': 'image/bmp', '.gif': 'image/gif', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' })[
+    ext.toLowerCase()
+  ] ?? 'image/png'
+
+function imageDataUrl(data: Uint8Array, ext: string): string {
+  let binary = ''
+  for (let offset = 0; offset < data.length; offset += 0x8000) {
+    binary += String.fromCharCode(...data.subarray(offset, offset + 0x8000))
+  }
+  return `data:${imageMime(ext)};base64,${btoa(binary)}`
+}
+
 function apiUrl(path: string, profile?: string): string {
   const url = new URL(path, window.location.origin)
   if (profile && !url.searchParams.has('profile')) {
@@ -112,6 +125,14 @@ const bridge = new Proxy(
       return true
     },
     readClipboard: () => navigator.clipboard.readText(),
+    saveImageBuffer: async (data: Uint8Array, ext: string) => {
+      const uploaded = await api<{ path: string }>({
+        body: { data_url: imageDataUrl(data, ext), filename: `pasted-image${ext}` },
+        method: 'POST',
+        path: '/api/chat/image-upload'
+      })
+      return uploaded.path
+    },
     getPathForFile: () => '',
     notify: async (payload: NotificationPayload) => {
       if (Notification.permission === 'granted') {
