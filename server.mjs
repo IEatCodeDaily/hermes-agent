@@ -78,7 +78,15 @@ const server = createServer((req, res) => {
   if (!file.startsWith(root)) { res.writeHead(403); return res.end() }
   try { if (statSync(file).isDirectory()) file = join(file, 'index.html') } catch { file = join(root, 'index.html') }
   res.setHeader('Content-Type', types[extname(file)] ?? 'application/octet-stream')
-  if (file.endsWith('/index.html')) res.setHeader('Set-Cookie', `hermes_ws=${browserToken}; Path=/api; Secure; HttpOnly; SameSite=Strict`)
+  // Hashed assets are immutable; HTML must never be cached, or a stale
+  // index.html keeps requesting chunk hashes from an older build and the app
+  // crashes on a half-swapped bundle ("l is not a function").
+  if (file.endsWith('/index.html')) {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+    res.setHeader('Set-Cookie', `hermes_ws=${browserToken}; Path=/api; Secure; HttpOnly; SameSite=Strict`)
+  } else {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  }
   createReadStream(file).on('error', () => { res.writeHead(404); res.end() }).pipe(res)
 })
 
