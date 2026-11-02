@@ -221,7 +221,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         owner's sessions start without it, so every attach and re-attach asks (#134889 ACP-4). The flag is
         the session's: a viewer that hides reasoning later turns it off until the editor attaches again."""
         try:
-            await client.rpc("config.set", session_id=session_id, key="show_reasoning", value="1", _timeout=10)
+            import os
+            value = "0" if os.environ.get("HERMES_ACP_SHOW_REASONING", "1").lower() in {"0", "false", "off"} else "1"
+            await client.rpc("config.set", session_id=session_id, key="show_reasoning", value=value, _timeout=10)
         except Exception:
             # Boundary: a display flag must not fail the attach (a refusal, a lost connection, or no answer
             # within the CLI's 10 s). At worst the session runs without live reasoning; a reconnect's

@@ -128,16 +128,22 @@ def _history_replay_updates(history: list[dict[str, Any]]):
     text (with compaction ``_meta``), assistant thoughts, and tool-call start/complete pairs
     (``todo`` results also re-emit the plan)."""
     active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+    show_reasoning = os.environ.get("HERMES_ACP_SHOW_REASONING", "1").lower() not in {"0", "false", "off"}
     for message in history:
         role = str(message.get("role") or "")
         if role == "user":
             if (chunk := _history_message_chunk(role, message)) is not None:
                 yield chunk
         elif role == "assistant":
+            from uuid import uuid4
+            message_id = str(uuid4())
             thought = _history_reasoning_text(message)
-            if thought:
-                yield acp.update_agent_thought_text(thought)
+            if thought and show_reasoning:
+                update = acp.update_agent_thought_text(thought)
+                update.message_id = message_id
+                yield update
             if (chunk := _history_message_chunk(role, message)) is not None:
+                chunk.message_id = message_id
                 yield chunk
             tool_calls = message.get("tool_calls")
             for tool_call in tool_calls if isinstance(tool_calls, list) else ():

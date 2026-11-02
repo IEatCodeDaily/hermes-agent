@@ -55,7 +55,8 @@ def logical_session_id(path, session_id):
     with SessionDB(db_path=path, read_only=True) as db:
         lineage = db.get_compression_lineage(session_id)
         root = lineage[0] if lineage else session_id
-        return _local_owners(db).get(root, root)
+        owners = _local_owners(db)
+        return next((owners[sid] for sid in reversed(lineage or [session_id]) if sid in owners), root)
 
 
 def catalog_sessions(path, cwd=None):
