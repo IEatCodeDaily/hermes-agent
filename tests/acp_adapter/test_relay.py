@@ -40,6 +40,13 @@ def test_reconnect_keeps_unsent_work_but_fails_sent_work():
         relay.on_gateway_line(_frame({'id': resume['id'], 'result': {}}))
         queued = [json.loads(line) for line in peer.recv(65536).splitlines()]
         assert [x['id'] for x in queued] == [3]
+        # A permission issued during resume must be answered immediately, not queued behind
+        # the resume whose completion may depend on it, nor replayed after another loss.
+        relay.replaying.add('hermes-relay:resume:s')
+        relay.on_gateway_line(_frame({'id': 7, 'method': 'session/request_permission', 'params': {}}))
+        relay.on_editor_line(_frame({'id': shown[-1]['id'], 'result': {'outcome': 'selected'}}))
+        assert json.loads(peer.recv(65536))['id'] == 7
+        assert relay.backlog == []
     finally:
         relay.selector.close()
         for sock in [left, right, replacement, peer]:

@@ -155,6 +155,12 @@ class Relay:
                 if origin is None or origin[0] != self.generation:
                     return  # answers a card of a connection that is gone
                 line = _frame({**message, "id": origin[1]})
+                if self.sock is not None:
+                    try:
+                        self.sock.sendall(line)
+                    except OSError:
+                        self.lost()
+                return  # responses belong to this connection, never the reconnect backlog
         self._send(key, line)
 
     # -- gateway -> editor --------------------------------------------------------------------
