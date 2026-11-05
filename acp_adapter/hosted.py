@@ -111,14 +111,10 @@ class HostedACPServer:
         except Exception:
             logger.exception('Hosted ACP connection failed')
         finally:
-            if connection is not None:
-                await connection._conn.close()
-            if agent is not None:
-                await agent.aclose()
-            writer.close()
-            with suppress(OSError):
-                await writer.wait_closed()
-            self.tasks.discard(task)
+            try:
+                await _close_projection(writer, connection, agent)
+            finally:
+                self.tasks.discard(task)
 
     async def stop(self):
         if self.server is not None:
@@ -135,6 +131,19 @@ class HostedACPServer:
                 if (info.st_dev, info.st_ino) == self.identity:
                     self.path.unlink()
             self.identity = None
+
+
+async def _close_projection(writer, connection, agent):
+    # Abort before the SDK drains its sender: a client that stopped reading must not
+    # hold the gateway's entire stop path hostage.
+    writer.transport.abort()
+    for close in (connection._conn.close if connection is not None else None,
+                  agent.aclose if agent is not None else None, writer.wait_closed):
+        if close is not None:
+            try:
+                await asyncio.wait_for(close(), 5)
+            except Exception:
+                logger.warning('ACP cleanup did not finish cleanly', exc_info=True)
 
 
 async def start_hosted_acp(runner):

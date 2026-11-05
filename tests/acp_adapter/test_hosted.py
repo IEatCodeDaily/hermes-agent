@@ -10,6 +10,29 @@ from acp_adapter.hosted import HostedACPServer
 from acp_adapter.relay import HEADER_VERSION
 
 
+@pytest.mark.asyncio
+async def test_cleanup_aborts_before_protocol_close_and_still_closes_agent():
+    from acp_adapter.hosted import _close_projection
+    calls = []
+
+    async def protocol_close():
+        assert calls == ['abort']
+        calls.append('protocol')
+        raise OSError('peer stopped reading')
+
+    async def agent_close():
+        calls.append('agent')
+
+    async def writer_closed():
+        calls.append('writer')
+
+    writer = SimpleNamespace(transport=SimpleNamespace(abort=lambda: calls.append('abort')),
+                             wait_closed=writer_closed)
+    connection = SimpleNamespace(_conn=SimpleNamespace(close=protocol_close))
+    await _close_projection(writer, connection, SimpleNamespace(aclose=agent_close))
+    assert calls == ['abort', 'protocol', 'agent', 'writer']
+
+
 @pytest.fixture
 def socket_home():
     from pathlib import Path

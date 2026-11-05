@@ -31,6 +31,7 @@ HEADER_VERSION = 1
 REATTACH_META = "hermesRelayReattach"
 _PREFIX = "hermes-relay:"
 _CHUNK = 64 * 1024
+_MAX_QUEUED_BYTES = 50 * 1024 * 1024
 LOST = ("The Hermes gateway restarted while this request was in flight; its outcome is unknown. "
         "Check the session before resending the work.")
 
@@ -106,6 +107,8 @@ class Relay:
         self.replaying = set()   # relay request ids the current gateway connection has not answered
         self.backlog = []        # (editor request key | None, line) held until the (re)attach settles
         self.disconnected_at = None
+        self.recovery_deadline = None
+        self.queued_bytes = 0
         self.generation = 0      # gateway connection count
         self.next_agent_id = 0   # editor-facing ids of gateway -> editor requests
         self.agent_requests = {}  # editor-facing id -> (generation, the gateway's own id)
@@ -129,7 +132,10 @@ class Relay:
 
     def _send(self, key, line: bytes) -> None:
         if self.sock is None or self.replaying:
+            if self.queued_bytes + len(line) > _MAX_QUEUED_BYTES:
+                raise RuntimeError("ACP reconnect queue exceeded its byte limit")
             self.backlog.append((key, line))
+            self.queued_bytes += len(line)
             return
         if key in self.pending:
             self.pending[key][2] = True
@@ -197,9 +203,9 @@ class Relay:
 
     def _settle_replay(self, ident: str, message: dict) -> None:
         self.replaying.discard(ident)
+        if "error" in message:
+            raise RuntimeError("Gateway refused ACP reattachment; work was not resubmitted")
         if ident == _PREFIX + "init":
-            if "error" in message:
-                raise RuntimeError("Gateway refused ACP reinitialization")
             replay = [(f"{_PREFIX}resume:{sid}", "session/resume",
                        {"sessionId": sid, "cwd": held["cwd"], "mcpServers": held["mcpServers"],
                         "_meta": {REATTACH_META: True}}) for sid, held in self.sessions.items()]
@@ -210,14 +216,13 @@ class Relay:
             except OSError:
                 self.lost()
                 return
-        if "error" in message and ident.startswith(_PREFIX + "resume:"):
-            # Deleted or retired while the gateway was down: its next prompt reports not_found.
-            self.sessions.pop(ident[len(_PREFIX + "resume:"):], None)
         if not self.replaying:
+            self.recovery_deadline = None
             self._flush()
 
     def _flush(self) -> None:
         backlog, self.backlog = self.backlog, []
+        self.queued_bytes = 0
         for key, line in backlog:
             self._send(key, line)
 
@@ -228,6 +233,8 @@ class Relay:
         self.sock.close()
         self.sock = None
         self.disconnected_at = time.monotonic()
+        if self.recovery_deadline is None:
+            self.recovery_deadline = self.disconnected_at + self.reconnect_seconds
         self.gateway_buf.clear()
         self.replaying.clear()
         self.agent_requests.clear()
@@ -261,12 +268,17 @@ class Relay:
         if not replay:
             self._flush()
 
+    def _check_recovery_deadline(self):
+        if self.recovery_deadline is not None and time.monotonic() >= self.recovery_deadline:
+            raise RuntimeError("ACP gateway reattachment timed out; work was not resubmitted")
+
     # -- loop ---------------------------------------------------------------------------------
     def run(self) -> int:
         self.disconnected_at = time.monotonic()
         if self.first is not None:
             self.attach(self.first)
         while True:
+            self._check_recovery_deadline()
             if self.sock is None:
                 if time.monotonic() - self.disconnected_at > self.reconnect_seconds:
                     print("hermes acp: the Hermes gateway did not come back; closing this ACP session",
@@ -274,7 +286,7 @@ class Relay:
                     return 1
                 if (sock := connect(self.path)) is not None:
                     self.attach(sock)
-            for key, _ in self.selector.select(timeout=None if self.sock else 1.0):
+            for key, _ in self.selector.select(timeout=1.0 if self.recovery_deadline is not None or not self.sock else None):
                 if key.data == "editor":
                     chunk = os.read(self.stdin_fd, _CHUNK)
                     if not chunk:  # the editor closed the session
@@ -334,6 +346,9 @@ def main(argv: list[str]) -> int:
         return Relay(path, sock).run()
     except (BrokenPipeError, KeyboardInterrupt):  # the editor went away mid-write
         return 0
+    except RuntimeError as exc:
+        print(f"hermes acp: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

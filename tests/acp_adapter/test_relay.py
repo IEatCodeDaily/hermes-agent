@@ -47,6 +47,19 @@ def test_reconnect_keeps_unsent_work_but_fails_sent_work():
         relay.on_editor_line(_frame({'id': shown[-1]['id'], 'result': {'outcome': 'selected'}}))
         assert json.loads(peer.recv(65536))['id'] == 7
         assert relay.backlog == []
+        import pytest
+        import acp_adapter.relay as module
+        # Recovery failures must not forget the session or release queued work.
+        with pytest.raises(RuntimeError, match='reattachment'):
+            relay._settle_replay('hermes-relay:resume:s', {'error': {'code': -32603}})
+        assert 's' in relay.sessions
+        relay.recovery_deadline = 0
+        with pytest.raises(RuntimeError, match='timed out'):
+            relay._check_recovery_deadline()
+        relay.replaying.add('hermes-relay:resume:s')
+        relay.queued_bytes = module._MAX_QUEUED_BYTES
+        with pytest.raises(RuntimeError, match='byte limit'):
+            relay._send(None, b'x')
     finally:
         relay.selector.close()
         for sock in [left, right, replacement, peer]:
