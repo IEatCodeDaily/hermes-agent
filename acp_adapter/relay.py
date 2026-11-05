@@ -50,7 +50,7 @@ def connect(path: str) -> socket.socket | None:
         sock.settimeout(2)
         sock.connect(path)
         from_peer = _peer_uid(sock)
-        if from_peer != os.getuid():
+        if from_peer != os.getuid():  # windows-footgun: ok — connect returns above on Windows
             raise PermissionError("ACP listener uid mismatch")
         sock.settimeout(None)
     except OSError:  # a stale file from a stopped gateway, or a socket we may not use

@@ -35,7 +35,7 @@ class HostedACPServer:
             raise PermissionError('ACP socket cannot be a symlink')
         if self.path.exists():
             info = self.path.lstat()
-            if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):  # windows-footgun: ok — POSIX start only
                 raise PermissionError('ACP socket path is not an owned socket')
             # The gateway has already acquired its exclusive runtime lock.
             self.path.unlink()
@@ -82,7 +82,7 @@ class HostedACPServer:
         self.tasks.add(task)
         agent = connection = None
         try:
-            if socket_peer_uid(writer.get_extra_info('socket')) != os.getuid():
+            if socket_peer_uid(writer.get_extra_info('socket')) != os.getuid():  # windows-footgun: ok — Unix listener only
                 raise PermissionError('ACP peer uid mismatch')
             # Bound the handshake separately from the much larger ACP image frame.
             header = await asyncio.wait_for(reader.readuntil(b'\n'), 10)
