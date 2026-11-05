@@ -335,6 +335,10 @@ _startup_fast.ensure_project_root_on_path()
 if _startup_fast.try_fast_version():
     raise SystemExit(0)
 
+if sys.argv[1:] == ["acp"]:
+    from acp_adapter.relay import exec_relay_if_hosted
+    exec_relay_if_hosted()
+
 import argparse
 import contextlib
 import json
