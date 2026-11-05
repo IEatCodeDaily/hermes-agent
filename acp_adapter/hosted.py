@@ -117,14 +117,15 @@ class HostedACPServer:
                 self.tasks.discard(task)
 
     async def stop(self):
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
+        server, self.server = self.server, None
+        if server is not None:
+            server.close()
         tasks = list(self.tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if server is not None:
+            await server.wait_closed()
         if self.identity is not None:
             with suppress(FileNotFoundError):
                 info = self.path.lstat()

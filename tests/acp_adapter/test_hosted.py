@@ -33,6 +33,35 @@ async def test_cleanup_aborts_before_protocol_close_and_still_closes_agent():
     assert calls == ['abort', 'protocol', 'agent', 'writer']
 
 
+@pytest.mark.asyncio
+async def test_stop_cancels_clients_before_waiting_for_server_connections():
+    # Python 3.12+ wait_closed waits for clients as well as the listening socket.
+    closed = asyncio.Event()
+    active = asyncio.Event()
+
+    async def client():
+        active.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def wait_closed():
+        await closed.wait()
+
+    server = HostedACPServer(SimpleNamespace(), '.')
+    server.server = SimpleNamespace(close=lambda: None, wait_closed=wait_closed)
+    task = asyncio.create_task(client())
+    server.tasks.add(task)
+    await active.wait()
+    try:
+        await asyncio.wait_for(server.stop(), 5)
+        assert task.cancelled()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.fixture
 def socket_home():
     from pathlib import Path
