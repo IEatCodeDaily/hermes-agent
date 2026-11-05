@@ -82,7 +82,8 @@ def test_silent_editor_discovery_is_bounded_and_reaps_only_itself(server_spec, t
         started = time.monotonic()
         # Left out of its session's selection (#134889 ACP-8), never fatal to it.
         assert json.loads(policy(authority, 'silent', silent, tmp_path).editor_mcp_json)['schemas'] == {}
-        assert time.monotonic() - started < 25
+        # Discovery allows 30s under memory pressure, plus bounded teardown.
+        assert time.monotonic() - started < 45
         names = [n for n in registry.get_all_tool_names() if n.startswith('mcp__')]
         assert len(names) == 1
         assert 'PRIVATE_A' in registry.dispatch(names[0], {})

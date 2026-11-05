@@ -35,7 +35,9 @@ def _json(value):
 
 
 def fingerprint(servers):
-    return hashlib.sha256(_json(servers).encode()).hexdigest()
+    # Projection references are ephemeral authority, not durable transport policy.
+    stable = [{k: v for k, v in spec.items() if k != '_acp_ref'} for spec in servers]
+    return hashlib.sha256(_json(stable).encode()).hexdigest()
 
 
 def validate_servers(servers):
@@ -55,11 +57,17 @@ def validate_servers(servers):
     try:
         for spec in servers:
             kind = spec.get('type', 'stdio')
-            model = kinds[kind].model_validate(spec)
+            if kind == 'acp':
+                from acp_adapter.mcp_tunnel import McpServerAcp, resolve_projection
+                clean = {k: v for k, v in spec.items() if k != '_acp_ref'}
+                model = McpServerAcp.model_validate(clean)
+                resolve_projection(spec.get('_acp_ref'), model.server_id)
+            else:
+                model = kinds[kind].model_validate(spec)
             if not model.name or model.name in names:
                 raise ValueError('duplicate server')
             names.add(model.name)
-    except (ValidationError, KeyError, AttributeError, TypeError, ValueError) as exc:
+    except (ValidationError, KeyError, AttributeError, TypeError, ValueError, ConnectionError) as exc:
         # Never the message: pydantic's carries ``input_value=`` and a server's argv may hold a credential.
         if isinstance(exc, ValidationError):
             why = '; '.join(f"{'.'.join(map(str, err['loc']))}: {err['type']}"
@@ -129,7 +137,9 @@ def _configs(servers, names, cwd):
     configs = {}
     for i, name in names.items():
         spec = servers[i]
-        if spec.get('type', 'stdio') == 'stdio':
+        if spec.get('type') == 'acp':
+            config = {'transport': 'acp', '_acp_ref': spec['_acp_ref'], 'server_id': spec['serverId']}
+        elif spec.get('type', 'stdio') == 'stdio':
             config = {'command': spec['command'], 'args': spec['args'],
                       'env': {e['name']: e['value'] for e in spec.get('env', [])}, 'cwd': cwd}
         else:
@@ -137,7 +147,7 @@ def _configs(servers, names, cwd):
             if spec['type'] == 'sse':
                 config['transport'] = 'sse'
         # One bounded eager discovery; no lazy or late schema refresh.
-        config.update(connect_timeout=5, tool_timeout=30, lazy=False)
+        config.update(connect_timeout=30, tool_timeout=30, lazy=False)
         configs[name] = config
     return configs
 
@@ -188,7 +198,7 @@ def _borrowed(authority, scope, servers, names, cwd, *, partial=False):
     from tools.mcp_tool_discovery import register_mcp_servers
     held = _held(authority, scope)
     # The cwd too: stdio servers run in it, so a committed workspace move respawns them there.
-    wanted = fingerprint([servers, cwd])
+    wanted = hashlib.sha256(_json([servers, cwd]).encode()).hexdigest()
     with session_tool_scope(scope):
         with held.lock:
             if held.fingerprint not in (None, wanted):
@@ -276,6 +286,16 @@ def attach_editor_mcp(authority, policy, servers):
     borrowed = getattr(authority, '_local_editor_mcp', None)
     if borrowed is None:
         borrowed = authority._local_editor_mcp = {}
+    previous = borrowed.get(data['scope'], [])
+    for old, new in zip(previous, servers):
+        if old.get('type') == 'acp' and old.get('_acp_ref') != new.get('_acp_ref'):
+            from acp_adapter.mcp_tunnel import resolve_projection
+            try:
+                resolve_projection(old.get('_acp_ref'), old['serverId'])
+            except ConnectionError:
+                pass  # a disconnected owner can be replaced by an authorized resume
+            else:
+                raise RuntimeStoreError('acp_mcp_owner_conflict')
     borrowed[data['scope']] = json.loads(_json(servers))
 
 

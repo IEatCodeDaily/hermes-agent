@@ -353,7 +353,8 @@ class MCPServerRunMixin:
                             reset_secret_scope(scope_token)
                 rebuild = True
                 self._auth_park = None
-                run_transport = self._run_http if self._is_http() else self._run_stdio
+                run_transport = (self._run_acp if config.get("transport") == "acp" else
+                                 self._run_http if self._is_http() else self._run_stdio)
                 self._resolved_identity = None  # the transport publishes the inputs it connects with
                 if not await self._on_clean_return(await run_transport(config), budget):
                     break

@@ -465,6 +465,11 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
     except InterruptedError:
         return tool_error("MCP call interrupted: user sent a new message")
     except Exception as exc:
+        # An ACP editor already owns recovery of its MCP service. Replaying here
+        # can repeat an admitted write or accidentally invoke local OAuth flows.
+        if getattr(server, '_config', {}).get('transport') == 'acp':
+            on_final_failure(exc)
+            return tool_error(_mcp_call_failed_message(exc))
         for recover in recoverers:
             recovered = recover(server_name, exc, call_once, op)
             if recovered is not None:

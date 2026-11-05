@@ -66,9 +66,10 @@ def _tools_changed_notice(payload):
 
 
 class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
-    def __init__(self, *, environ=None, connector=None):
+    def __init__(self, *, environ=None, connector=None, mcp_tunnel=False):
         self._environ = os.environ if environ is None else environ
         self._connector = connector
+        self._hosted_mcp = mcp_tunnel
         self._conn = None
         self._gateway = None
         self._connection = None
@@ -125,9 +126,16 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # Session -> the owner's latest usage dict (``session.usage`` / ``session.stats``).
         self._usage = {}
         self._background = set()
+        self._mcp_projection = None
 
     def on_connect(self, conn):
         self._conn = conn
+        # Only hosted projections share the gateway process and can hand it an
+        # in-memory transport. Legacy stdio keeps its existing MCP offerings.
+        if self._hosted_mcp:
+            from acp_adapter.mcp_tunnel import ProjectionMCP, install_routes
+            self._mcp_projection = ProjectionMCP(conn)
+            install_routes(conn, self)
         add_observer = getattr(getattr(conn, "_conn", None), "add_observer", None)
         if callable(add_observer):
             add_observer(self._observe_client_message)
@@ -143,13 +151,23 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     async def initialize(self, **kwargs):
         from hermes_cli import __version__
         from acp_adapter.auth import build_auth_methods
-        return InitializeResponse(protocol_version=acp.PROTOCOL_VERSION,
+        response = InitializeResponse(protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=__version__),
             agent_capabilities=AgentCapabilities(load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(fork=SessionForkCapabilities(), list=SessionListCapabilities(),
                                                          resume=SessionResumeCapabilities())),
             auth_methods=await asyncio.to_thread(build_auth_methods))
+        if self._mcp_projection is not None:
+            # The SDK capability model otherwise silently drops this unstable field.
+            response = response.model_dump(by_alias=True, exclude_none=True)
+            response["agentCapabilities"]["mcpCapabilities"] = {"acp": True}
+        return response
+
+    def _mcp_specs(self, servers):
+        if self._mcp_projection is not None:
+            return self._mcp_projection.bind(servers or [])
+        return [s.model_dump(by_alias=True) for s in servers or []]
 
     async def authenticate(self, method_id, **kwargs):
         from acp_adapter.server import HermesACPAgent
@@ -285,13 +303,13 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             flags.update(_bypass_route(self._environ))
         snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
             source="acp", cwd=_translate_acp_cwd(cwd),
-            editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
+            editor={"mcp_servers": self._mcp_specs(mcp_servers),
                     "edit_approval_policy": "ask"}, **flags)
         session_id = snapshot["session_id"]
         await self._adopt(session_id, snapshot)
         if mcp_servers:
             self._editor_mcp[session_id] = {
-                "mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers]}
+                "mcp_servers": self._mcp_specs(mcp_servers)}
         info = snapshot.get("info") or await client.rpc("session.info", session_id=session_id)
         await self._request_live_reasoning(client, session_id)
         return NewSessionResponse(session_id=session_id, **await self._session_fields(session_id, info, session_id))
@@ -371,7 +389,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             descriptor = await client.rpc("runtime.describe")
             if "acp-session-mcp-v1" not in descriptor.get("capabilities", []):
                 raise GatewayClientError("acp_mcp_policy_unavailable")
-            resume_params['editor'] = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]}
+            resume_params['editor'] = {'mcp_servers': self._mcp_specs(mcp_servers)}
         try:
             snapshot = await client.rpc("session.resume", session_id=session_id, **resume_params)
         except GatewayRPCError as exc:
@@ -468,7 +486,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         info = await client.rpc('session.info', session_id=session_id)
         # The owner binds the child's editor servers under the child's own scope: these, or else a
         # copy of the parent's.
-        payload = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]} if mcp_servers else {}
+        payload = {'mcp_servers': self._mcp_specs(mcp_servers)} if mcp_servers else {}
         self._unacked.pop(session_id, None)
         result = await self._mutations.apply(client, session_id, 'branch', payload)
         child = result['branched_session_id']
@@ -1228,6 +1246,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return False
 
     async def aclose(self):
+        if self._mcp_projection is not None:
+            await self._mcp_projection.aclose()
         # Post-attach notices first: one paused mid-notice would otherwise resume after the
         # teardown and open a fresh gateway connection through ``_client``.
         background = list(self._background)

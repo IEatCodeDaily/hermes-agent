@@ -32,6 +32,35 @@ hermes acp / hermes-acp / python -m acp_adapter
 
 Stdout is reserved for ACP JSON-RPC transport. Human-readable logs go to stderr.
 
+### Cheap hosted connections and editor MCP
+
+On Unix, a running gateway exposes an owned mode-0600 ACP socket. `hermes acp`
+uses a stdlib-only relay rather than loading another agent runtime. If that
+socket is unavailable, the existing stdio projection remains the fallback.
+
+Hosted projections also accept the connection-oriented MCP-over-ACP proposal:
+`mcpCapabilities.acp` selects `{type: "acp", name, serverId}` server descriptors.
+The gateway reuses its native MCP discovery, tool registry and `ClientSession`
+over bounded in-memory streams; no stdio MCP helper process is needed.
+`acp_adapter/mcp_tunnel.py` keeps the SDK schema/wire compatibility local to each
+connection rather than modifying installed SDK classes. This implements the
+connection-oriented `mcp/connect`, `mcp/message`, and `mcp/disconnect` contract,
+not the newer stateless proposal that uses the same capability name.
+
+Live transport references are private, process-local authority, never persisted
+in session policy or receipts. Session tool scopes remain separate, including
+forks. Another live editor cannot replace a session's existing ACP-MCP owner
+just by supplying matching server names. An authorized resume can supply a new
+transport after the previous owner disconnects. Frozen schemas still change
+only at the existing session boundaries.
+
+Closing a projection invalidates its transport references and fails pending
+requests. The relay disconnects editor-side MCP sessions when its gateway
+connection is lost, including late replies to old connection requests. Already
+sent tool calls are never replayed after transport loss; their outcome must be
+checked before re-invocation. Legacy stdio/HTTP/SSE servers retain their existing
+transports and discovery path.
+
 ### Gateway terminal projection
 
 `acp_adapter/gateway_server.py` waits for the completion of the exact submitted

@@ -102,7 +102,7 @@ class HostedACPServer:
             from acp import AgentSideConnection
             from acp_adapter.gateway_server import GatewayACPAgent
             # Do not merge the gateway's launch flags into an unrelated editor's policy.
-            agent = GatewayACPAgent(environ=env, connector=self._connect)
+            agent = GatewayACPAgent(environ=env, connector=self._connect, mcp_tunnel=True)
             with attached_client(self.runner):
                 connection = AgentSideConnection(agent, writer, reader, listening=False, use_unstable_protocol=True)
                 await connection.listen()

@@ -6,6 +6,37 @@ import socket
 from acp_adapter.relay import Relay, _frame
 
 
+def test_gateway_loss_closes_mcp_sessions_and_late_connects():
+    read, write = os.pipe()
+    left, right = socket.socketpair()
+    relay = Relay('unused', left, stdin_fd=read)
+    shown = []
+    relay._to_editor = lambda data: shown.append(json.loads(data))
+    try:
+        relay.attach(left)
+        right.recv(65536)
+        relay.on_gateway_line(_frame({'id': 9, 'method': 'mcp/connect', 'params': {'serverId': 'editor'}}))
+        relay.on_editor_line(_frame({'id': shown[-1]['id'], 'result': {'connectionId': 'first'}}))
+        right.recv(65536)
+        relay.on_gateway_line(_frame({'id': 10, 'method': 'mcp/connect', 'params': {'serverId': 'editor'}}))
+        late = shown[-1]['id']
+        relay.lost()
+        assert shown[-1]['method'] == 'mcp/disconnect'
+        assert shown[-1]['params']['connectionId'] == 'first'
+        relay.on_editor_line(_frame({'id': shown[-1]['id'], 'result': {}}))
+        relay.on_editor_line(_frame({'id': late, 'result': {'connectionId': 'late'}}))
+        assert shown[-1]['method'] == 'mcp/disconnect'
+        assert shown[-1]['params']['connectionId'] == 'late'
+        assert relay.backlog == []
+        assert not relay.agent_requests
+    finally:
+        relay.selector.close()
+        left.close()
+        right.close()
+        os.close(read)
+        os.close(write)
+
+
 def test_reconnect_keeps_unsent_work_but_fails_sent_work():
     read, write = os.pipe()
     left, right = socket.socketpair()

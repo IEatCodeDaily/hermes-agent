@@ -111,7 +111,10 @@ class Relay:
         self.queued_bytes = 0
         self.generation = 0      # gateway connection count
         self.next_agent_id = 0   # editor-facing ids of gateway -> editor requests
-        self.agent_requests = {}  # editor-facing id -> (generation, the gateway's own id)
+        self.agent_requests = {}  # editor-facing id -> (generation, gateway id, method, connection id)
+        self.mcp_connections = set()  # editor-owned IDs must not outlive a gateway generation
+        self.mcp_cleanup = set()  # relay disconnect responses never enter a new gateway projection
+        self.next_cleanup_id = 0
         self.editor_buf, self.gateway_buf = bytearray(), bytearray()
         self.selector = selectors.DefaultSelector()
         self.selector.register(stdin_fd, selectors.EVENT_READ, "editor")
@@ -157,7 +160,21 @@ class Relay:
                 if message["method"] == "initialize":
                     self.initialize = params
             else:  # the editor's answer to a gateway request: restore the gateway's id
-                origin = self.agent_requests.pop(_key(message["id"]), None)
+                answer_key = _key(message["id"])
+                if answer_key in self.mcp_cleanup:
+                    self.mcp_cleanup.discard(answer_key)
+                    return
+                origin = self.agent_requests.pop(answer_key, None)
+                if origin is not None and origin[2] == 'mcp/connect':
+                    result = message.get('result')
+                    connection_id = result.get('connectionId') if isinstance(result, dict) else None
+                    if isinstance(connection_id, str):
+                        if origin[0] != self.generation or self.sock is None:
+                            self._disconnect_mcp(connection_id)
+                        else:
+                            self.mcp_connections.add(connection_id)
+                if origin is not None and origin[2] == 'mcp/disconnect' and 'result' in message:
+                    self.mcp_connections.discard(origin[3])
                 if origin is None or origin[0] != self.generation:
                     return  # answers a card of a connection that is gone
                 line = _frame({**message, "id": origin[1]})
@@ -176,7 +193,9 @@ class Relay:
             ident = message["id"]
             if "method" in message:  # a gateway request: give it an editor-facing id
                 self.next_agent_id += 1
-                self.agent_requests[_key(self.next_agent_id)] = (self.generation, ident)
+                self.agent_requests[_key(self.next_agent_id)] = (
+                    self.generation, ident, message['method'],
+                    (message.get('params') or {}).get('connectionId'))
                 line = _frame({**message, "id": self.next_agent_id})
             elif isinstance(ident, str) and ident in self.replaying:
                 self._settle_replay(ident, message)
@@ -237,11 +256,23 @@ class Relay:
             self.recovery_deadline = self.disconnected_at + self.reconnect_seconds
         self.gateway_buf.clear()
         self.replaying.clear()
-        self.agent_requests.clear()
+        # Keep only outstanding connects: a late response still allocates an
+        # editor-side MCP session that must be closed, never adopted/replayed.
+        self.agent_requests = {k: v for k, v in self.agent_requests.items() if v[2] == 'mcp/connect'}
+        for connection_id in self.mcp_connections:
+            self._disconnect_mcp(connection_id)
+        self.mcp_connections.clear()
         for key in [key for key, (_, _, sent) in self.pending.items() if sent]:
             del self.pending[key]
             self._to_editor(_frame({"jsonrpc": "2.0", "id": json.loads(key),
                                     "error": {"code": -32603, "message": LOST}}))
+
+    def _disconnect_mcp(self, connection_id):
+        self.next_cleanup_id += 1
+        ident = f'{_PREFIX}mcp-close:{self.next_cleanup_id}'
+        self.mcp_cleanup.add(_key(ident))
+        self._to_editor(_frame({'jsonrpc': '2.0', 'id': ident, 'method': 'mcp/disconnect',
+                                'params': {'connectionId': connection_id}}))
 
     def attach(self, sock: socket.socket) -> None:
         self.disconnected_at = None
