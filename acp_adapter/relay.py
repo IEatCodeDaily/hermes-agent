@@ -152,10 +152,9 @@ class Relay:
                     self.initialize = params
             else:  # the editor's answer to a gateway request: restore the gateway's id
                 origin = self.agent_requests.pop(_key(message["id"]), None)
-                if origin is not None:
-                    if origin[0] != self.generation:
-                        return  # answers a card of a connection that is gone
-                    line = _frame({**message, "id": origin[1]})
+                if origin is None or origin[0] != self.generation:
+                    return  # answers a card of a connection that is gone
+                line = _frame({**message, "id": origin[1]})
         self._send(key, line)
 
     # -- gateway -> editor --------------------------------------------------------------------
@@ -225,6 +224,7 @@ class Relay:
         self.disconnected_at = time.monotonic()
         self.gateway_buf.clear()
         self.replaying.clear()
+        self.agent_requests.clear()
         for key in [key for key, (_, _, sent) in self.pending.items() if sent]:
             del self.pending[key]
             self._to_editor(_frame({"jsonrpc": "2.0", "id": json.loads(key),
