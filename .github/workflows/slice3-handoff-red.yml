@@ -31,6 +31,7 @@ jobs:
             'tree/hermes_state_sessions.py': '2234276fe7dab15c85eaad9bd8ac7b9830112b1e364418a19350af98b7d1b148',
             'tree/gateway/restart_handoff.py': '52b413f71510989c83979ba2331c259bd870d403520a8c01c58196aa0f903843',
             'tree/gateway/session_handoff.py': '9cf9e20ca0965dcdd7e5a15887b8e3757a77a23dfcbceef0925feed5bb3edb46',
+            'tree/gateway/session_controls.py': 'd4c2b46892ade34603e8803d77cec96a969cbf22ce955b4a5eef0570cdc7e43e',
           }
           files = json.load(open('setup-resource-v4-manifest.json'))['files']
           bad = []
