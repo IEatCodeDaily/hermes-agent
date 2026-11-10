@@ -58,7 +58,9 @@ def ensure_session_handoff(owner, session_id: str) -> dict | None:
     """
     db = owner.db
     logical = owner.logical_owner(session_id) or session_id
-    physical = owner.physical_target(session_id)
+    from types import SimpleNamespace
+    # Production physical_target(ref) reads ref.session_id; the fixture lambda takes any arg.
+    physical = owner.physical_target(SimpleNamespace(session_id=session_id))
     epoch = int(owner.epoch)
     with db._read_ctx() as conn:
         seen = _meta(conn, _seen_key(logical))
@@ -77,11 +79,23 @@ def ensure_session_handoff(owner, session_id: str) -> dict | None:
 
     def write(conn):
         current = _meta(conn, _seen_key(logical))
-        if current is not None and int(current) == epoch:
+        if current is None:
+            # Seen key vanished mid-flight (retirement raced this write): treat as first sight.
+            conn.execute("INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)",
+                         (_seen_key(logical), str(epoch)))
+            return None
+        if int(current) == epoch:
             record = _meta(conn, _record_key(logical, epoch))
             return json.loads(record) if record is not None else None
-        from_epoch = int(current) if current is not None else 0
-        summary = _recovery_summary(conn, logical)
+        from_epoch = int(current)
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM session_admissions WHERE target_session_id=? "
+            "AND status IN ('queued','started','unknown') GROUP BY status", (logical,)).fetchall()
+        counts = {status: count for status, count in rows}
+        # 'started' without a receipt is uncertainty the notice must state, not hide: a crash
+        # before recover_session_inputs leaves it unmarked.
+        summary = {"queued": int(counts.get("queued", 0)),
+                   "unknown": int(counts.get("unknown", 0)) + int(counts.get("started", 0))}
         handoff_id = hashlib.sha256(
             f"{owner.profile_id}:{logical}:{epoch}".encode()).hexdigest()[:32]
         message_uid = f"gateway-handoff-{handoff_id}"
