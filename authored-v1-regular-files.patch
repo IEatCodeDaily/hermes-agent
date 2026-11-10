@@ -1,0 +1,347 @@
+diff --git a/tests/gateway/test_external_drain_admission.py b/tests/gateway/test_external_drain_admission.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_external_drain_admission.py
+@@ -0,0 +1,58 @@
++"""External maintenance blocks new work, not accepted work or its settlement."""
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_authority import SessionAuthority
++from hermes_state_runtime import RuntimeStoreError
++
++
++@pytest.mark.parametrize('transactional', [False, True])
++@pytest.mark.parametrize('external,restart,wait,retiring,options,refused', [
++    (False, False, False, False, {}, False),
++    (True, False, False, False, {}, True),
++    (True, False, False, False, {'queue_only': True}, True),
++    (True, False, False, False, {'existing_work': True}, False),
++    (False, True, False, False, {'existing_work': True}, True),
++    (False, True, True, False, {'existing_work': True}, True),
++    (False, True, True, False, {'queue_only': True, 'existing_work': True}, False),
++    (False, True, True, False, {'queue_only': True}, False),
++    (True, True, True, False, {'queue_only': True}, True),
++    (True, False, False, True, {'existing_work': True}, True),
++])
++def test_admission_policy(transactional, external, restart, wait, retiring, options, refused):
++    authority = SessionAuthority.__new__(SessionAuthority)
++    authority.runner = SimpleNamespace(_draining=restart, _running=True,
++        session_runtime_descriptor={'drain_reason': 'restart_wait' if wait else ''})
++    if external:
++        authority.runner._external_drain_active = True
++    authority.retiring = retiring
++    authorized = []
++    conn = object()
++
++    def admit():
++        if transactional:
++            authority._admission_gate(authorized.append, **options)(conn)
++        else:
++            authority._require_admission_open(**options)
++
++    if refused:
++        with pytest.raises(RuntimeStoreError) as exc:
++            admit()
++        assert exc.value.reason == 'runtime_draining'
++        assert authorized == []
++    else:
++        admit()
++        assert authorized == ([conn] if transactional else [])
++
++
++def test_transaction_rechecks_external_drain():
++    authority = SessionAuthority.__new__(SessionAuthority)
++    authority.runner = SimpleNamespace(_draining=False)
++    authority.retiring = False
++    authorized = []
++    gate = authority._admission_gate(authorized.append, queue_only=True)
++    authority.runner._external_drain_active = True
++    with pytest.raises(RuntimeStoreError, match='runtime_draining'):
++        gate(object())
++    assert authorized == []
+diff --git a/tests/gateway/test_handoff_deadline.py b/tests/gateway/test_handoff_deadline.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_handoff_deadline.py
+@@ -0,0 +1,59 @@
++"""Single restart deadline, including a frozen pre-stop event loop."""
++import os
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import restart_handoff
++
++
++def test_duplicate_restart_cannot_extend_deadline(monkeypatch):
++    now = [100.0]
++    monkeypatch.setattr(restart_handoff.time, 'monotonic', lambda: now[0])
++    runner = SimpleNamespace(_restart_after_turn_timeout=20, _restart_drain_timeout=0)
++    first = restart_handoff.begin(runner, stop_budget=60, arm=False)
++    assert first.deadline == 180
++    now[0] = 110
++    assert restart_handoff.begin(runner, stop_budget=600, arm=False) is first
++    assert first.remaining() == 70
++    assert first.phase_budget(100, reserve=10) == 60
++    now[0] = 181
++    assert first.remaining() == first.phase_budget(30) == 0
++
++
++def test_thread_watchdog_covers_frozen_pre_stop_loop(tmp_path):
++    code = '''
++import asyncio
++import time
++from types import SimpleNamespace
++from gateway.restart_handoff import begin
++async def main():
++    runner = SimpleNamespace(_restart_after_turn_timeout=0, _restart_drain_timeout=0)
++    begin(runner, stop_budget=0.2)
++    print('ARMED', flush=True)
++    time.sleep(30)
++asyncio.run(main())
++'''
++    env = dict(os.environ)
++    env.pop('PYTEST_CURRENT_TEST', None)
++    env['HERMES_HOME'] = str(tmp_path / 'home')
++    env['HERMES_RUNTIME_DIR'] = str(tmp_path / 'runtime')
++    env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
++    with subprocess.Popen([sys.executable, '-c', code], env=env, stdout=subprocess.PIPE,
++                          stderr=subprocess.PIPE, text=True) as child:
++        try:
++            stdout, stderr = child.communicate(timeout=10)
++        except subprocess.TimeoutExpired:
++            child.kill()
++            child.communicate()
++            pytest.fail('pre-stop watchdog did not terminate frozen fixture')
++    assert 'ARMED' in stdout
++    assert child.returncode == 75, stderr
++
++
++def test_maintenance_drain_does_not_create_deadline():
++    runner = SimpleNamespace(_external_drain_active=True)
++    assert restart_handoff.snapshot(runner) == {'admission_ready': False, 'drain_reason': 'external_drain'}
++    assert not hasattr(runner, '_restart_handoff')
+diff --git a/tests/gateway/test_handoff_single_owner.py b/tests/gateway/test_handoff_single_owner.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_handoff_single_owner.py
+@@ -0,0 +1,44 @@
++"""A killed predecessor releases the existing profile lock, never a second live writer."""
++import os
++import select
++import subprocess
++import sys
++
++import pytest
++
++from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
++
++
++@pytest.mark.platforms('linux', 'macos')
++def test_successor_reserves_only_after_predecessor_exit(tmp_path):
++    home = tmp_path / 'profile'
++    code = '''
++import sys
++from pathlib import Path
++from gateway.runtime_ownership import ProfileOwnership
++owner = ProfileOwnership()
++owner.reserve([Path(sys.argv[1])])
++print('RESERVED', flush=True)
++sys.stdin.read()
++'''
++    child = subprocess.Popen([sys.executable, '-c', code, str(home)], stdin=subprocess.PIPE,
++                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
++    successor = ProfileOwnership()
++    try:
++        assert select.select([child.stdout], [], [], 10)[0], 'fixture never reserved'
++        assert child.stdout.readline().strip() == 'RESERVED'
++        with pytest.raises(OwnershipConflict):
++            successor.reserve([home])
++        assert not successor.owns(home)
++        child.kill()
++        child.wait(timeout=10)
++        successor.reserve([home])
++        assert successor.owns(home)
++    finally:
++        successor.close()
++        if child.poll() is None:
++            child.kill()
++            child.wait(timeout=10)
++        child.stdin.close()
++        child.stdout.close()
++        child.stderr.close()
+diff --git a/tests/gateway/test_joint_discovery_canaries.py b/tests/gateway/test_joint_discovery_canaries.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_joint_discovery_canaries.py
+@@ -0,0 +1,53 @@
++"""Additional discovery smoke on a bounded fixture library, never host skills."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent import prompt_builder as pb, skill_utils as su
++from tools import skills_tool as st
++
++
++@pytest.fixture
++def library(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    skills = home / 'skills'
++    for name, description in [('backup', 'PostgreSQL backup'), ('hermes-agent', 'Hermes help')]:
++        folder = skills / 'ops' / name
++        folder.mkdir(parents=True)
++        (folder / 'SKILL.md').write_text(f'---\nname: {name}\ndescription: {description}\n---\nFixture guidance.\n')
++    (home / 'config.yaml').write_text('skills:\n  external_dirs: []\n')
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(st, 'SKILLS_DIR', skills)
++    monkeypatch.chdir(tmp_path)
++    import hermes_cli.plugins as plugins
++    monkeypatch.setattr(plugins, 'discover_plugins', lambda: None)
++    monkeypatch.setattr(plugins, 'get_plugin_manager', lambda: SimpleNamespace(list_plugin_skill_metadata=lambda: []))
++    su._raw_config_cache_clear()
++    su._external_dirs_cache_clear()
++    st._SKILLS_CACHE.clear()
++    yield
++    st._SKILLS_CACHE.clear()
++    su._raw_config_cache_clear()
++    su._external_dirs_cache_clear()
++
++
++def test_prompt_builder_list_and_unknown_tools(library):
++    rows = {'ops': [('x', 'X desc')]}
++    compact = pb._render_skills_index(rows, {}, frozenset({'ops'}), ['skills_list', 'skill_view'])
++    assert '[names only]' in compact and 'X desc' not in compact
++    unknown = pb._render_skills_index(rows, {}, frozenset({'ops'}), None)
++    assert '[names only]' in unknown
++    prompt = pb.build_skills_system_prompt(available_tools={'skills_list', 'skill_view'})
++    assert '[names only]' in prompt
++    assert 'NO arguments at all' in prompt
++    assert prompt.count('hermes-agent') == 1
++
++
++def test_blank_and_zero_match_fallback(library):
++    full = json.loads(st.skills_list())
++    assert len(full['skills']) == 2
++    assert json.loads(st.skills_list(query='', category=''))['skills'] == full['skills']
++    assert json.loads(st.skills_list(query='zzz-none'))['total_matches'] == 0
++    assert json.loads(st.skills_list())['skills'] == full['skills']
++    assert json.loads(st.skills_list(query='x' * 201))['success'] is False
+diff --git a/tests/gateway/test_session_handoff_notice.py b/tests/gateway/test_session_handoff_notice.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_session_handoff_notice.py
+@@ -0,0 +1,108 @@
++"""Durable handoff identity survives DB reopen; uncertain admissions are never replayed."""
++import select
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_runtime import (RuntimeStoreError, admit_session_input, begin_runtime_epoch,
++                                  claim_session_input, recover_session_inputs)
++from gateway.session_handoff import ensure_session_handoff
++
++
++@pytest.fixture
++def authority(tmp_path):
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('session', source='local')
++    epoch = begin_runtime_epoch(db, instance_id='first')
++    owner = SimpleNamespace(db=db, epoch=epoch, profile_id='fixture',
++                            logical_owner=lambda sid: 'session', physical_target=lambda ref: 'session')
++    yield owner
++    db.close()
++
++
++def test_one_notice_after_reopen_and_duplicate_resume(authority):
++    assert ensure_session_handoff(authority, 'session') is None
++    path = authority.db.db_path
++    authority.db.close()
++    authority.db = SessionDB(path)
++    authority.epoch = begin_runtime_epoch(authority.db, instance_id='second')
++    first = ensure_session_handoff(authority, 'session')
++    assert first['from_epoch'] == authority.epoch - 1
++    assert first['to_epoch'] == authority.epoch
++    assert ensure_session_handoff(authority, 'compressed-alias') == first
++    rows = authority.db.get_messages('session')
++    notices = [r for r in rows if r.get('display_kind') == 'gateway_handoff']
++    assert len(notices) == 1
++    assert notices[0]['message_uid'] == first['message_uid']
++    assert notices[0]['role'] == 'session_meta'
++    model_history, _display_history = authority.db.get_resume_conversations('session')
++    assert model_history == []
++
++
++def test_failed_notice_transaction_does_not_advance_seen(authority, monkeypatch):
++    ensure_session_handoff(authority, 'session')
++    authority.epoch = begin_runtime_epoch(authority.db, instance_id='second')
++    original = authority.db._insert_message_rows
++    def fail_after_insert(*args, **kwargs):
++        original(*args, **kwargs)
++        raise OSError('fixture full disk')
++    monkeypatch.setattr(authority.db, '_insert_message_rows', fail_after_insert)
++    with pytest.raises(OSError):
++        ensure_session_handoff(authority, 'session')
++    assert authority.db.get_messages('session') == []
++    monkeypatch.setattr(authority.db, '_insert_message_rows', original)
++    assert ensure_session_handoff(authority, 'session')['from_epoch'] == authority.epoch - 1
++
++
++def test_killed_owner_retains_unknown_and_queued_inputs(authority, tmp_path):
++    ensure_session_handoff(authority, 'session')
++    path = str(authority.db.db_path)
++    authority.db.close()
++    code = '''
++import sys
++from hermes_state import SessionDB
++from hermes_state_runtime import admit_session_input, claim_session_input
++with SessionDB(sys.argv[1]) as db:
++    epoch = int(sys.argv[2])
++    admit_session_input(db, epoch=epoch, principal_id='human', session_id='session', request_id='sent', payload={'text':'fixture'})
++    claim_session_input(db, epoch=epoch, session_id='session')
++    admit_session_input(db, epoch=epoch, principal_id='human', session_id='session', request_id='unsent', payload={'text':'next'})
++    print('CLAIMED', flush=True)
++    sys.stdin.read()
++'''
++    child = subprocess.Popen([sys.executable, '-c', code, path, str(authority.epoch)],
++                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        assert select.select([child.stdout], [], [], 10)[0], 'fixture never claimed'
++        assert child.stdout.readline().strip() == 'CLAIMED'
++        child.kill()
++        child.wait(timeout=10)
++    finally:
++        if child.poll() is None:
++            child.kill()
++            child.wait(timeout=10)
++        child.stdin.close()
++        child.stdout.close()
++        child.stderr.close()
++    authority.db = SessionDB(path)
++    old = authority.epoch
++    authority.epoch = begin_runtime_epoch(authority.db, instance_id='successor')
++    recover_session_inputs(authority.db, epoch=authority.epoch)
++    notice = ensure_session_handoff(authority, 'session')
++    assert notice['recovery_summary'] == {'queued': 1, 'unknown': 1}
++    with pytest.raises(RuntimeStoreError, match='unknown_execution'):
++        claim_session_input(authority.db, epoch=authority.epoch, session_id='session')
++    with pytest.raises(RuntimeStoreError, match='stale_epoch'):
++        claim_session_input(authority.db, epoch=old, session_id='session')
++
++
++def test_retirement_removes_notice_metadata(authority):
++    ensure_session_handoff(authority, 'session')
++    authority.epoch = begin_runtime_epoch(authority.db, instance_id='second')
++    ensure_session_handoff(authority, 'session')
++    authority.db.delete_session('session')
++    with authority.db._read_ctx() as conn:
++        assert conn.execute("SELECT key FROM state_meta WHERE key LIKE 'session_handoff%'").fetchall() == []

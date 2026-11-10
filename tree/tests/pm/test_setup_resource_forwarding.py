@@ -1,0 +1,126 @@
+"""Setup-only resource policy regressions. Authored; NOT RUN."""
+import os
+from pathlib import Path
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from pm.environment import PythonEnvironment, _base_environment
+from pm.runtime import runtime_environment
+import sys
+
+# Reuse the admitted test interpreter; this regression must not stage another PM runtime.
+
+CAPS = {
+    "UV_CONCURRENT_DOWNLOADS": "1",
+    "UV_CONCURRENT_BUILDS": "1",
+    "UV_CONCURRENT_INSTALLS": "1",
+    "UV_CONCURRENT_CACHE_READS": "1",
+}
+POISON = {
+    "UV_PROJECT": "/untrusted/project",
+    "UV_PYTHON": "/untrusted/python",
+    "UV_PROJECT_ENVIRONMENT": "/untrusted/env",
+    "UV_CACHE_DIR": "/untrusted/cache",
+    "UV_CONFIG_FILE": "/untrusted/config",
+    "UV_CONCURRENT_UNKNOWN": "99",
+    "PYTHONPATH": "/untrusted/imports",
+    "VIRTUAL_ENV": "/untrusted/venv",
+}
+
+
+def assert_filtered(env):
+    assert {key: env[key] for key in CAPS} == CAPS
+    assert not set(POISON).intersection(env)
+
+
+def test_repeated_real_base_filter():
+    env = {**CAPS, **POISON}
+    for _ in range(4):
+        env = _base_environment(env)
+        assert_filtered(env)
+
+
+@pytest.mark.parametrize("no_config", [False, True])
+def test_bootstrap_worker_actual_uv_boundary(tmp_path, monkeypatch, no_config):
+    from pm import client
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    ambient = {**CAPS, **POISON, "HOME": str(home),
+               "HERMES_HOME": str(home / "hermes"),
+               "HERMES_RUNTIME_DIR": str(home / "runtime"),
+               "PIP_CONFIG_FILE": os.devnull, "UV_INDEX_URL": "https://example.invalid/simple"}
+    with patch.dict(os.environ, ambient, clear=True):
+        bootstrap = runtime_environment()
+        assert_filtered(bootstrap)
+        # _request uses runtime_environment then _worker_command before Popen.
+        with patch.object(client, "runtime_command", return_value=["private-python", "worker.py"]) as command:
+            worker_env = runtime_environment()
+            client._worker_command(SimpleNamespace(bootstrap="policy"),
+                                   {"explicit": True}, tmp_path / "worker.py", worker_env)
+            command.assert_called_once_with(tmp_path / "worker.py", cache=None)
+        assert_filtered(worker_env)
+        # _run is also used by stage_runtime(no_config=True); no uv is launched here.
+        environment = PythonEnvironment(uv=tmp_path / "uv", python=tmp_path / "python",
+                                        destination=tmp_path / "venv", cache=tmp_path / "cache",
+                                        env=_base_environment(worker_env), no_config=no_config)
+        with patch("pm.environment.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            environment._run(["sync", "--frozen"], cwd=tmp_path, timeout=1)
+        actual = run.call_args.kwargs["env"]
+        assert {key: actual[key] for key in CAPS} == CAPS
+        assert actual["UV_PYTHON"] == str(environment.python)
+        assert actual["UV_PROJECT_ENVIRONMENT"] == str(environment.destination)
+        assert actual["UV_CACHE_DIR"] == str(environment.cache)
+        assert actual["UV_PYTHON_DOWNLOADS"] == "never"
+        assert not {"UV_PROJECT", "UV_CONFIG_FILE", "UV_CONCURRENT_UNKNOWN", "PYTHONPATH", "VIRTUAL_ENV"}.intersection(actual)
+        assert ("--no-config" in run.call_args.args[0]) is no_config
+        assert ("UV_INDEX_URL" not in actual) is no_config
+
+
+def test_actual_worker_protocol_preserves_resource_limits(tmp_path, monkeypatch):
+    import json
+    import textwrap
+
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    for key, value in {**CAPS, **POISON}.items():
+        monkeypatch.setenv(key, value)
+    script = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(root)!r})
+        from pathlib import Path
+        from unittest.mock import patch
+        import subprocess
+        from pm import build_operations, worker
+        from pm.environment import PythonEnvironment, _base_environment
+        from pm.runtime import runtime_environment
+        def probe(cache, ci=False):
+            env = runtime_environment()
+            assert {{k: env[k] for k in {CAPS!r}}} == {CAPS!r}
+            assert not set({POISON!r}).intersection(env)
+            engine = PythonEnvironment(uv=Path('unused'), python=Path(cache)/'python',
+                destination=Path(cache)/'venv', cache=Path(cache), env=env, no_config=True)
+            with patch('pm.environment.subprocess.run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                engine._run(['sync', '--frozen'], cwd=Path(cache), timeout=1)
+            actual = run.call_args.kwargs['env']
+            assert {{k: actual[k] for k in {CAPS!r}}} == {CAPS!r}
+            assert actual['UV_PYTHON'] == str(Path(cache)/'python')
+            assert actual['UV_CACHE_DIR'] == str(Path(cache))
+            assert 'UV_PROJECT' not in actual
+            return 'resource limits survived actual worker dispatch'
+        build_operations.prune_cache = probe
+        worker.main()
+    """)
+    request = {"id": "resource-probe", "operation": "prune_cache",
+               "arguments": {"cache": str(tmp_path)}, "callbacks": [], "packages": [],
+               "context": {"repo": str(root), "lockfile": str(root / "pm/lock.json")}}
+    child = subprocess.run([sys.executable, "-I", "-B", "-c", script],
+                           input=json.dumps(request) + "\n", env=runtime_environment(),
+                           capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0
+    assert json.loads(child.stdout)["result"] == "resource limits survived actual worker dispatch"

@@ -1,0 +1,113 @@
+name: slice3-handoff-red
+
+# Runs ONLY on this branch. Verifies the frozen Talos capture byte-for-byte,
+# builds the canonical private PM environment with the four UV_CONCURRENT caps
+# forwarded (=1), then produces the first executed evidence: setup-resource
+# regressions (expected pass), settings-only uv boundary proof, and the focused
+# handoff regressions (expected RED — the handoff implementation is not built).
+on:
+  push:
+    branches: [ci/slice3-handoff-red]
+permissions:
+  contents: read
+concurrency:
+  group: slice3-handoff-red
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify frozen capture integrity (manifest entries)
+        run: |
+          python3 - <<'PY'
+          import json, hashlib, pathlib, sys
+          files = json.load(open('setup-resource-v4-manifest.json'))['files']
+          bad = []
+          for e in files:
+              p = pathlib.Path(e['path'])
+              if not p.is_file():
+                  bad.append(('missing', e['path'])); continue
+              b = p.read_bytes()
+              if len(b) != e['size'] or hashlib.sha256(b).hexdigest() != e['sha256']:
+                  bad.append(('mismatch', e['path']))
+          print(f"verified={len(files)} bad={len(bad)}")
+          for kind, path in bad[:20]:
+              print(kind, path)
+          sys.exit(1) if bad else sys.exit(0)
+          PY
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            tree/pyproject.toml
+            tree/uv.lock
+
+      - name: Python 3.14 (tree/.python-version)
+        run: uv python install 3.14
+
+      - name: "Private PM environment (canonical command; setup inputs modified: 4 UV_CONCURRENT caps = 1)"
+        working-directory: tree
+        env:
+          UV_CONCURRENT_DOWNLOADS: '1'
+          UV_CONCURRENT_BUILDS: '1'
+          UV_CONCURRENT_INSTALLS: '1'
+          UV_CONCURRENT_CACHE_READS: '1'
+        run: |
+          PY="$(uv python find 3.14)"
+          "$PY" -m pm.build_env --source . --out ci --group dev --group test --python "$PY"
+
+      - name: Setup-resource forwarding regressions (expected PASS)
+        working-directory: tree
+        env:
+          TZ: UTC
+          LANG: C.UTF-8
+        run: |
+          ci/bin/python -m pytest tests/pm/test_setup_resource_forwarding.py -q 2>&1 | tee ../setup-resource-tests.log
+
+      - name: Settings-only uv boundary evidence (bootstrap + app; NOT canonical worker-chain proof)
+        working-directory: tree
+        continue-on-error: true
+        env:
+          UV_CONCURRENT_DOWNLOADS: '1'
+          UV_CONCURRENT_BUILDS: '1'
+          UV_CONCURRENT_INSTALLS: '1'
+          UV_CONCURRENT_CACHE_READS: '1'
+          TZ: UTC
+          LANG: C.UTF-8
+        run: |
+          ci/bin/python ../uv-settings-evidence.py --tree . --uv ci/bin/uv --python ci/bin/python --private ../evidence 2>&1 | tee ../settings-evidence.log
+          test -f ../evidence/settings-only.json && cat ../evidence/settings-only.json
+
+      - name: "Focused handoff RED (expected FAIL — failures are evidence, not a broken build)"
+        working-directory: tree
+        continue-on-error: true
+        env:
+          TZ: UTC
+          LANG: C.UTF-8
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          mkdir -p "$HERMES_HOME"
+          HERMES_PYTHON="$PWD/ci/bin/python" bash scripts/run_tests.sh \
+            tests/gateway/test_external_drain_admission.py \
+            tests/gateway/test_handoff_deadline.py \
+            tests/gateway/test_handoff_single_owner.py \
+            tests/gateway/test_joint_discovery_canaries.py \
+            tests/gateway/test_session_handoff_notice.py \
+            --file-retries 0 --file-timeout 240 -j 2 -q 2>&1 | tee ../handoff-red.log
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: slice3-evidence
+          path: |
+            setup-resource-tests.log
+            settings-evidence.log
+            evidence/settings-only.json
+            handoff-red.log
+          if-no-files-found: warn

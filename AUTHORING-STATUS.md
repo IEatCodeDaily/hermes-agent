@@ -1,0 +1,1 @@
+SOURCE AUTHORING ONLY; checks NOT RUN. Setup inputs modified; no unchanged canonical PM claim. Explicit --compile-bytecode retained in private environment. No execution grant or future attempt handle.

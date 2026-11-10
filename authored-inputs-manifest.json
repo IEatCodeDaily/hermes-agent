@@ -1,0 +1,40 @@
+{
+  "status": "UNEXECUTED TESTS ONLY; NOT AN IMPLEMENTATION CANDIDATE",
+  "files": [
+    {
+      "path": "tests/gateway/test_external_drain_admission.py",
+      "pre_sha256": null,
+      "pre_mode": "ABSENT",
+      "post_sha256": "41cefabd89dc44b48af5b1e20b0034a00c1364ce27a65d284dd3d8c4797051a8",
+      "post_mode": "0o664"
+    },
+    {
+      "path": "tests/gateway/test_handoff_deadline.py",
+      "pre_sha256": null,
+      "pre_mode": "ABSENT",
+      "post_sha256": "484296e71a86b3c60d5d3ba31672af3de68c52007772ddf4b47446c867f5aa3d",
+      "post_mode": "0o664"
+    },
+    {
+      "path": "tests/gateway/test_handoff_single_owner.py",
+      "pre_sha256": null,
+      "pre_mode": "ABSENT",
+      "post_sha256": "c1e30ced3b4c68283f7cf0016afc96c70ae668d1cfdd27e828611697f8808f1c",
+      "post_mode": "0o664"
+    },
+    {
+      "path": "tests/gateway/test_joint_discovery_canaries.py",
+      "pre_sha256": null,
+      "pre_mode": "ABSENT",
+      "post_sha256": "01c3b47097dbb876690df86ad6d499543807a0c9b14a9ec2457a1c49eaa47dff",
+      "post_mode": "0o664"
+    },
+    {
+      "path": "tests/gateway/test_session_handoff_notice.py",
+      "pre_sha256": null,
+      "pre_mode": "ABSENT",
+      "post_sha256": "19f19229ffe19445fc401d91d92864846cdbed7f7a7c7f95f5bc152689c7cd6a",
+      "post_mode": "0o664"
+    }
+  ]
+}

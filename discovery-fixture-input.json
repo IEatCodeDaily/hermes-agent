@@ -1,0 +1,8 @@
+{
+  "source": "/home/rpw/hermes-addon-patches/scripts/test_skill_discovery_integration.py",
+  "fixture_path": "tests/tools/test_skill_discovery_integration.py",
+  "sha256": "1c87ee278ca316b59c9d608e60178b79246aebe173397e65423f4f7bec5e1d93",
+  "bytes": 9170,
+  "serving_preimage": "ABSENT",
+  "kind": "owner-supplied-fixture-only"
+}

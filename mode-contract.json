@@ -1,0 +1,55 @@
+{
+  "version": 3,
+  "head": "e0352634dd385ec591d975d9902459ba1a054a78",
+  "semantics": "safe tarfile.data_filter; six fixture files explicitly normalized to0644",
+  "old_input_manifest_sha256": "6ba71608e03a72fc3f04faf466d7ca577e00cae6b26bb4fd633332460975200b",
+  "mode_delta": [
+    {
+      "path": "tests/gateway/test_external_drain_admission.py",
+      "old_mode": "0o664",
+      "new_mode": "0o644",
+      "sha256": "41cefabd89dc44b48af5b1e20b0034a00c1364ce27a65d284dd3d8c4797051a8"
+    },
+    {
+      "path": "tests/gateway/test_handoff_deadline.py",
+      "old_mode": "0o664",
+      "new_mode": "0o644",
+      "sha256": "484296e71a86b3c60d5d3ba31672af3de68c52007772ddf4b47446c867f5aa3d"
+    },
+    {
+      "path": "tests/gateway/test_handoff_single_owner.py",
+      "old_mode": "0o664",
+      "new_mode": "0o644",
+      "sha256": "c1e30ced3b4c68283f7cf0016afc96c70ae668d1cfdd27e828611697f8808f1c"
+    },
+    {
+      "path": "tests/gateway/test_joint_discovery_canaries.py",
+      "old_mode": "0o664",
+      "new_mode": "0o644",
+      "sha256": "01c3b47097dbb876690df86ad6d499543807a0c9b14a9ec2457a1c49eaa47dff"
+    },
+    {
+      "path": "tests/gateway/test_session_handoff_notice.py",
+      "old_mode": "0o664",
+      "new_mode": "0o644",
+      "sha256": "19f19229ffe19445fc401d91d92864846cdbed7f7a7c7f95f5bc152689c7cd6a"
+    },
+    {
+      "path": "tests/tools/test_skill_discovery_integration.py",
+      "old_mode": "0o664",
+      "new_mode": "0o644",
+      "sha256": "1c87ee278ca316b59c9d608e60178b79246aebe173397e65423f4f7bec5e1d93"
+    }
+  ],
+  "source_content_changes": [],
+  "historical_receipts_sha256": {
+    "/home/rpw/.hermes/cache/scratch/hermes-joint-handoff-20261110/serial02-input.tar.gz": "6ac5737c376834245948bf788e26e9fbc9b960f39fe3b414ee3d5ec40227a104",
+    "/home/rpw/.hermes/cache/scratch/hermes-joint-handoff-20261110/serial02-freeze.json": "442c9f71011254bad958eceb5ebdb8cf3602beb674da75dafe3dbf9785118687",
+    "/home/rpw/.hermes/cache/scratch/hermes-joint-handoff-20261110/serial02-receipts.json": "4d2300ec7e790da740341f980a98f90a88a0669a567af5a312d4e95c6a0fb258",
+    "/home/rpw/.hermes/cache/scratch/hermes-joint-handoff-20261110/serial02-integrity-refusal.json": "10b5fce2732e0fe1267d4d9ecef057e8d7b2be4f19bda22ac081de083763139c",
+    "/home/rpw/.hermes/cache/scratch/hermes-joint-handoff-20261110/serial02-ssh-exit": "0f8ef3377b30fc47f96b48247f463a726a802f62f3faa03d56403751d2f66c67",
+    "/home/rpw/.hermes/cache/scratch/hermes-joint-handoff-20261110/serial02-input/input-manifest.json": "6ba71608e03a72fc3f04faf466d7ca577e00cae6b26bb4fd633332460975200b"
+  },
+  "roundtrip_status": "AUTHORED NOT RUN",
+  "tests_patch_sha256": "9f9aa5521aa579649e62f8021ad8a63128b33e4b41cf18de5c96ccee0b1a60dd"
+}

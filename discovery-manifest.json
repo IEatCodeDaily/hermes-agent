@@ -1,0 +1,73 @@
+{
+  "feature": "compact skill discovery (query+fallback skills_list; names-only index; parser-safe)",
+  "owner_thread": "this thread (discovery/skill-slimming owner)",
+  "patch_file": "patches/compact-skill-discovery-candidate.patch",
+  "patch_sha256": "7a007c9b9c63cb6e84a05dcb378503d69fd22d602c0db7c7d8b7d105c5ef5992",
+  "serving_base": "Talos ~/.hermes/hermes-agent HEAD e0352634dd385ec591d975d9902459ba1a054a78",
+  "installed_live_state_verified_20261109": {
+    "gateway": "MainPID=1696042 ActiveState=active ",
+    "head": "e0352634dd385ec591d975d9902459ba1a054a78",
+    "files": {
+      "agent/prompt_builder.py": "b116c28e21d34789eccc6ac462347fae292068091b4be426dd98c5e94efd9a50",
+      "tools/skills_tool.py": "080e11eb0b8a52313c1705619b8a448e2ba524685f718b103bbb199618d25636",
+      "tests/agent/test_skills_index_delta.py": "18301a63fbbb5ea93c80d828fb4cbe9b26c8ab6def671f5743de424055635a22",
+      "tests/agent/test_prompt_builder.py": "e0e09b2e3cf2f6cce8b12b36c8425ac2c2cdd45fd6ed1fdeb038ffdc6e4f7f80"
+    },
+    "modes": {
+      "agent/prompt_builder.py": "0o644",
+      "tools/skills_tool.py": "0o644",
+      "tests/agent/test_skills_index_delta.py": "0o644",
+      "tests/agent/test_prompt_builder.py": "0o644"
+    }
+  },
+  "files": [
+    {
+      "path": "agent/prompt_builder.py",
+      "mode": "0o644",
+      "post_sha256": "b116c28e21d34789eccc6ac462347fae292068091b4be426dd98c5e94efd9a50",
+      "pre_sha256": "1baa8a654a13da62d422d4cfa32b645d6757b0e92042f62cff92b12c03cd17c7",
+      "preimage_backup": "talos:~/.cache/scratch-discovery-backup/agent__prompt_builder.py"
+    },
+    {
+      "path": "tools/skills_tool.py",
+      "mode": "0o644",
+      "post_sha256": "080e11eb0b8a52313c1705619b8a448e2ba524685f718b103bbb199618d25636",
+      "pre_sha256": "f75e1047efba2640daefa2f03b897db12ac74890792621151ed9fbfd974176b8",
+      "preimage_backup": "talos:~/.cache/scratch-discovery-backup/tools__skills_tool.py"
+    },
+    {
+      "path": "tests/agent/test_skills_index_delta.py",
+      "mode": "0o644",
+      "post_sha256": "18301a63fbbb5ea93c80d828fb4cbe9b26c8ab6def671f5743de424055635a22",
+      "pre_sha256": "18d40e9066b2bf7a1f4aeef0741464effda01867627ca97769883894f8bbbdac",
+      "preimage_backup": "local baseline: ~/.hermes/cache/scratch/skill-catalogue/baseline/tests/agent/test_skills_index_delta.py"
+    },
+    {
+      "path": "tests/agent/test_prompt_builder.py",
+      "mode": "0o644",
+      "post_sha256": "e0e09b2e3cf2f6cce8b12b36c8425ac2c2cdd45fd6ed1fdeb038ffdc6e4f7f80",
+      "pre_sha256": "8b10b4089636a8ebc89b97d49892f19e7a073ad25a81369a1da456d4c39357bc",
+      "preimage_backup": "local baseline: ~/.hermes/cache/scratch/skill-catalogue/baseline/tests/agent/test_prompt_builder.py"
+    }
+  ],
+  "new_files": [
+    "none in serving tree \u2014 all four files are modifications of existing tracked files"
+  ],
+  "canary_runtime": {
+    "deployed_builder_probe": "talos: cd ~/.hermes/hermes-agent && venv/bin/python -B -c: build_skills_system_prompt(available_tools={skills_list,skill_view,skill_manage}) -> 41 [names only] rows / 0 description rows / discovery note present; skills_list(query=..) lexical + blank-args full 420 listing",
+    "normal_model_canary": "delegate on Talos env 68ad0128-60f9-48fd-b1bf-088588d22200, read-only skills-tool discovery task (find PG backup skills; recover per guidance; load one) \u2014 latest receipt: recall+fallback+loadability PASS (rev ec49e687 build; final rev adds list-coercion + cache-key fix, focused 145/0 incl system_prompt 71)",
+    "receipts": [
+      "docs/evidence/skill-discovery-talos-live-state-20261109.json",
+      "docs/evidence/skill-discovery-final-ci-diff.json",
+      "docs/evidence/skill-discovery-talos-install.json",
+      "docs/evidence/skill-discovery-plugin-green.txt",
+      "docs/compact-skill-discovery.md"
+    ]
+  },
+  "rollback": "git apply -R patches/compact-skill-discovery-candidate.patch in serving tree, then restore preimage backups above (all four files modified-in-place, no additions/deletions)",
+  "acceptance_status": {
+    "full_repo_ci": "GREEN (62,764 passed both trees; candidate failures subset of baseline; 2 flakes proven isolated-green)",
+    "talos_discovery_canary": "PASS",
+    "not_claimed": "blue-green acceptance, joint handoff \u2014 pending your gates"
+  }
+}
