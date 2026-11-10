@@ -63,9 +63,10 @@ def test_killed_owner_retains_unknown_and_queued_inputs(authority, tmp_path):
     authority.db.close()
     code = '''
 import sys
+from pathlib import Path
 from hermes_state import SessionDB
 from hermes_state_runtime import admit_session_input, claim_session_input
-with SessionDB(sys.argv[1]) as db:
+with SessionDB(Path(sys.argv[1])) as db:
     epoch = int(sys.argv[2])
     admit_session_input(db, epoch=epoch, principal_id='human', session_id='session', request_id='sent', payload={'text':'fixture'})
     claim_session_input(db, epoch=epoch, session_id='session')
