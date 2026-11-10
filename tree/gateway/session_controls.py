@@ -634,6 +634,13 @@ class AuthorityConnection:
             # whose earlier open found it busy (Desktop's warm `session.activate` resumes on one connection).
             from gateway.session_policy_refresh import refresh_resumed_policy
             await refresh_resumed_policy(self.authority, ref, attached=ref.session_id in self.subscriptions)
+        # The durable gateway-handoff notice commits BEFORE the snapshot: it is an ordinary
+        # transcript row (deterministic uid, one per logical session per owner epoch), so
+        # attach's existing history carries it, duplicate resumes collapse on the id, and
+        # session_meta's existing model-history exclusion keeps it out of the LLM context.
+        from gateway.session_handoff import ensure_session_handoff
+        handoff_notice = await asyncio.to_thread(
+            ensure_session_handoff, self.authority, ref.session_id)
         snapshot = await self.authority.attach(self.actor, ref)
         self.subscriptions[ref.session_id] = snapshot.subscription_id
         self._spawn_notice(ref)
@@ -657,6 +664,7 @@ class AuthorityConnection:
                 'messages': history, **display, 'message_count': len(history),
                 'running': snapshot.handle.execution_state == 'running',
                 'authority_epoch': snapshot.handle.authority_epoch,
+                'handoff': handoff_notice,
                 'replay_epoch': snapshot.replay_epoch, 'last_sequence': snapshot.last_sequence,
                 'subscription_id': snapshot.subscription_id, 'revision': snapshot.handle.revision,
                 'execution_generation': snapshot.handle.execution_generation,
