@@ -1618,6 +1618,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             )
             return False
         timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
+        handoff = getattr(self, "_restart_handoff", None)
+        if handoff is not None:  # never let this phase exceed the one handoff deadline
+            timeout = handoff.phase_budget(timeout)
         if timeout <= 0:
             logger.info(
                 "Restart requested with %d active work unit(s); "
@@ -1676,6 +1679,14 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._draining = True
         from gateway.drain_control import open_restart_wait
         open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
+        # ONE handoff deadline armed at restart admission: covers the after-turn wait, stop drain
+        # and teardown in a single monotonic bound, with a thread watchdog hard-exiting a wedged
+        # loop. Duplicate restart requests reuse this context and can never extend it.
+        from gateway.restart_handoff import begin as begin_restart_handoff
+        from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+        begin_restart_handoff(
+            self, stop_budget=resolve_shutdown_watchdog_delay(
+                float(getattr(self, "_stop_drain_timeout", 0.0) or 0.0)), arm=True)
         # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
         # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
         self._mark_api_runs_shutdown_requested()
@@ -1688,6 +1699,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     await self._launch_detached_restart_command()
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            handoff = getattr(self, "_restart_handoff", None)
+            if handoff is not None:  # clean exit reached: the watchdog must not fire on the way out
+                handoff.disarm()
 
         # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
         # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in

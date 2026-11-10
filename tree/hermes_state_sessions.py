@@ -1775,6 +1775,9 @@ class SessionSessionsMixin:
                 conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (sid,))
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
             conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in scope])
+            for sid in scope:  # handoff identity dies with the session (retirement contract)
+                conn.execute("DELETE FROM state_meta WHERE key = ? OR key LIKE ?",
+                             ("session_handoff_seen_v1:" + sid, "session_handoff_v1:" + sid + ":%"))
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(scope)
             return True
