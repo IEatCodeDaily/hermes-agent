@@ -469,12 +469,34 @@ def acp_delegate_refusal(platform: Optional[str]) -> Optional[str]:
     return None
 
 
+def gateway_hosted_process() -> bool:
+    """True inside a process that has hosted at least one gateway session.
+
+    Session-context binding is the transport-level fact: standalone CLI/oneshot
+    processes never bind it. Policy follows the host process, not profile or
+    toolset state, so no profile/toolset change can re-arm native spawning on
+    the gateway; agent None is equally refused there (no parent-agent bypass).
+    """
+    try:
+        from gateway.session_context import session_context_engaged
+    except Exception:
+        return False
+    return bool(session_context_engaged())
+
+
 def native_delegate_refusal(agent: Any) -> Optional[str]:
     """Pin transport policy on the host-owned agent, never on model arguments.
 
     Resolve the source only once: a later tool thread may have no session context,
-    or another session may be bound there. ACP platform is always restrictive.
+    or another session may be bound there. ACP platform is always restrictive, and
+    a gateway-hosted process denies native spawning for EVERY session regardless
+    of platform, profile or toolset changes; standalone processes are unchanged.
     """
+    if gateway_hosted_process():
+        return ("delegate_task spawning is disabled for gateway-hosted sessions: delegate new "
+                "work through the editor's namespaced delegate_task tool. Existing children "
+                "remain available via delegate_task(action='list'/'steer'/'stop'). "
+                "[disabled by policy]")
     if agent is None:
         return acp_delegate_refusal(None)
     denied = getattr(agent, "_native_delegate_spawn_denied", None)

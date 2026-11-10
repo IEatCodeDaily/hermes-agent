@@ -1,0 +1,78 @@
+name: native-policy-gateway
+
+# Gateway-level native-spawn policy gate: the exact v1 affected-file set
+# (17 files / 275+71 tests, proven on the frozen candidate) plus the v2
+# gateway-hosted predicate tests. Runs ONLY on this branch.
+on:
+  push:
+    branches: [ci/native-gateway-policy-v2]
+permissions:
+  contents: read
+concurrency:
+  group: native-policy-gateway
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            tree/pyproject.toml
+            tree/uv.lock
+
+      - name: Python 3.14 (tree/.python-version)
+        run: uv python install 3.14
+
+      - name: Private PM environment (canonical command)
+        working-directory: tree
+        env:
+          UV_CONCURRENT_DOWNLOADS: '1'
+          UV_CONCURRENT_BUILDS: '1'
+          UV_CONCURRENT_INSTALLS: '1'
+          UV_CONCURRENT_CACHE_READS: '1'
+        run: |
+          PY="$(uv python find 3.14)"
+          "$PY" -m pm.build_env --source . --out ci --group dev --group test --python "$PY"
+
+      - name: Native-policy affected files (v1 gate set + v2 gateway predicate)
+        working-directory: tree
+        continue-on-error: true
+        env:
+          TZ: UTC
+          LANG: C.UTF-8
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          mkdir -p "$HERMES_HOME"
+          HERMES_PYTHON="$PWD/ci/bin/python" bash scripts/run_tests.sh \
+            tests/agent/test_background_review_cache_parity.py \
+            tests/agent/test_bot_chat_toolset_refresh.py \
+            tests/agent/test_prompt_cache_prefix_contract.py \
+            tests/agent/test_system_prompt_restore.py \
+            tests/tools/test_acp_delegate_gate.py \
+            tests/tools/test_compaction_tool_refresh.py \
+            tests/tools/test_delegate.py \
+            tests/tools/test_delegate_capability_inheritance.py \
+            tests/tools/test_delegate_composite_toolsets.py \
+            tests/tools/test_delegate_control_actions.py \
+            tests/tools/test_delegate_toolset_scope.py \
+            tests/tools/test_initial_policy_snapshot.py \
+            tests/tools/test_native_delegate_policy.py \
+            tests/tools/test_refresh_agent_mcp_tools.py \
+            tests/tools/test_tool_search.py \
+            tests/tools/test_tool_search_context_provider.py \
+            tests/tools/test_tool_search_multiquery.py \
+            --file-retries 0 --file-timeout 240 -j 2 -q 2>&1 | tee ../native-policy-gate.log
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-policy-gate
+          path: native-policy-gate.log
+          if-no-files-found: warn

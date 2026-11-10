@@ -12,6 +12,9 @@ def isolated_source(monkeypatch):
     from gateway import session_context as sc
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
     token = sc._SESSION_SOURCE.set("")
+    # Force the process-level gateway latch OFF: this suite must be order-independent
+    # no matter which earlier test file in the same pytest process bound a session.
+    monkeypatch.setattr(sc, "_session_context_engaged", False)
     try:
         yield
     finally:
@@ -113,6 +116,52 @@ def test_standalone_spawn_reaches_unchanged_validation(monkeypatch):
     result = json.loads(dt.delegate_task(tasks=[], parent_agent=parent("cli")))
     assert "disabled by policy" not in result.get("error", "")
     assert "error" in result
+
+
+@pytest.mark.parametrize("seam", ["direct", "none_parent", "registry", "agent"])
+def test_gateway_hosted_process_denies_spawn_on_every_platform(monkeypatch, seam):
+    """The process latch is the policy: any platform, and parent_agent=None, are refused."""
+    from gateway import session_context as sc
+    from tools import delegate_tool as dt
+    from tools.registry import registry
+    from run_agent import AIAgent
+    monkeypatch.setattr(sc, "_session_context_engaged", True)
+    config = Mock(side_effect=AssertionError("spawn reached config"))
+    monkeypatch.setattr(dt, "_load_config", config)
+    args = {"tasks": [{"goal": "do not run"}]}
+    calls = {
+        "direct": lambda: dt.delegate_task(**args, parent_agent=parent("cli")),
+        "none_parent": lambda: dt.delegate_task(**args, parent_agent=None),
+        "registry": lambda: registry.dispatch("delegate_task", args, parent_agent=parent("cli")),
+        "agent": lambda: AIAgent._dispatch_delegate_task(parent("cli"), args),
+    }
+    raw = calls[seam]()
+    assert "disabled by policy" in raw
+    config.assert_not_called()
+
+
+def test_gateway_hosted_child_constructor_refuses(monkeypatch):
+    from gateway import session_context as sc
+    from tools import delegate_tool as dt
+    monkeypatch.setattr(sc, "_session_context_engaged", True)
+    runtime = Mock(side_effect=AssertionError("child constructor reached config"))
+    monkeypatch.setattr(dt, "_get_max_spawn_depth", runtime)
+    with pytest.raises(ValueError, match="disabled by policy"):
+        dt._build_child_agent(0, "do not run", None, None, None, 1, 1, parent("cli"))
+    runtime.assert_not_called()
+
+
+def test_gateway_hosted_schema_is_control_only(monkeypatch):
+    from gateway import session_context as sc
+    from toolsets import native_delegate_control_tools, native_delegate_refusal
+    monkeypatch.setattr(sc, "_session_context_engaged", True)
+    p = parent("cli")
+    assert native_delegate_refusal(p)
+    assert native_delegate_refusal(None)
+    tools = native_delegate_control_tools(p, [{"type": "function", "function": {"name": "read_file"}}])
+    schema = next(d["function"] for d in tools if d["function"]["name"] == "delegate_task")
+    assert set(schema["parameters"]["properties"]) == {"action", "subagent_id", "message"}
+    assert schema["parameters"]["properties"]["action"]["enum"] == ["list", "steer", "stop"]
 
 
 def test_discovery_control_only_and_deferred_catalog_cannot_redisclose_spawn(monkeypatch):
