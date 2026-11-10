@@ -80,7 +80,11 @@ jobs:
           TZ: UTC
           LANG: C.UTF-8
         run: |
-          ci/bin/python ../uv-settings-evidence.py --tree . --uv ci/bin/uv --python ci/bin/python --private ../evidence 2>&1 | tee ../settings-evidence.log
+          STORE="$(ci/bin/python -c "import sys; sys.path.insert(0,'.'); from pm.paths import store_root; print(store_root())")"
+          UV_BIN="$(find "$STORE" -type f -name uv -perm -u+x 2>/dev/null | head -1)"
+          test -n "$UV_BIN" || { echo "PM store has no staged uv binary — settings evidence NOT RUN"; exit 1; }
+          echo "PM-staged uv: $UV_BIN ($("$UV_BIN" --version))"
+          ci/bin/python ../uv-settings-evidence.py --tree . --uv "$UV_BIN" --python ci/bin/python --private ../evidence 2>&1 | tee ../settings-evidence.log
           test -f ../evidence/settings-only.json && cat ../evidence/settings-only.json
 
       - name: "Focused handoff RED (expected FAIL — failures are evidence, not a broken build)"
