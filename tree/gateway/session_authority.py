@@ -1076,14 +1076,13 @@ class SessionAuthority:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
-            self._require_admission_open(existing_work=True)
+            self._require_admission_open()
             from gateway.session_runtime_workers import tracked_write
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
-                                                    session_id=ref.session_id,
-                                                    _guard=self._admission_gate(existing_work=True),
+                                                    session_id=ref.session_id, _guard=self._admission_gate(),
                                                     head=first['admission_id'] if first is not None else None),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read

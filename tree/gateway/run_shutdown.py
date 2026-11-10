@@ -1619,17 +1619,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             return False
         timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
         handoff = getattr(self, "_restart_handoff", None)
-        clamped_by_handoff = False
-        if handoff is not None:  # never let this phase consume the stop's share of the one deadline
-            clamped = handoff.phase_budget(timeout, reserve=handoff.stop_budget)
-            clamped_by_handoff = handoff is not None and clamped < timeout
-            timeout = clamped
+        if handoff is not None:  # never let this phase exceed the one handoff deadline
+            timeout = handoff.phase_budget(timeout)
         if timeout <= 0:
             logger.info(
-                "Restart requested with %d active work unit(s); %s — entering stop()/drain immediately",
-                active,
-                "handoff deadline leaves no after-turn budget" if clamped_by_handoff
-                else "restart_after_turn_timeout=0",
+                "Restart requested with %d active work unit(s); "
+                "restart_after_turn_timeout=0 — entering stop()/drain immediately", active,
             )
             return False
         logger.info(

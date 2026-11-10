@@ -12,16 +12,16 @@ reversible until cleared or TTL, by design.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 WATCHDOG_EXIT_CODE = 75
 
 
 class RestartHandoff:
-    def __init__(self, deadline: float, stop_budget: float = 0.0):
+    def __init__(self, deadline: float):
         self.deadline = deadline
-        self.stop_budget = stop_budget
-        self._done: "threading.Event | None" = None
+        self._timer: threading.Timer | None = None
 
     def remaining(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
@@ -31,9 +31,9 @@ class RestartHandoff:
         return max(0.0, min(float(budget), self.remaining() - float(reserve)))
 
     def disarm(self) -> None:
-        done, self._done = self._done, None
-        if done is not None:
-            done.set()
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
 
 
 def begin(runner, *, stop_budget: float, arm: bool = True) -> RestartHandoff:
@@ -43,15 +43,13 @@ def begin(runner, *, stop_budget: float, arm: bool = True) -> RestartHandoff:
         return existing
     after_turn = float(getattr(runner, "_restart_after_turn_timeout", 0.0) or 0.0)
     drain = float(getattr(runner, "_restart_drain_timeout", 0.0) or 0.0)
-    handoff = RestartHandoff(time.monotonic() + float(stop_budget) + after_turn + drain,
-                             stop_budget=float(stop_budget))
+    handoff = RestartHandoff(time.monotonic() + float(stop_budget) + after_turn + drain)
     runner._restart_handoff = handoff
     if arm and not os.environ.get("PYTEST_CURRENT_TEST"):
-        # The in-house backstop: dumps all thread stacks before hard-exit, observes a
-        # late disarm within ~1s via its done-event, and no-ops on a nonpositive delay.
-        from gateway.shutdown_watchdog import arm_shutdown_watchdog
-        handoff._done = arm_shutdown_watchdog(handoff.remaining(), exit_code=WATCHDOG_EXIT_CODE,
-                                              name="gateway-restart-handoff-watchdog")
+        timer = threading.Timer(handoff.remaining(), os._exit, args=(WATCHDOG_EXIT_CODE,))
+        timer.daemon = True
+        handoff._timer = timer
+        timer.start()
     return handoff
 
 
