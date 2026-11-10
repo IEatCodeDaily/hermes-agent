@@ -32,7 +32,7 @@ jobs:
             'tree/gateway/restart_handoff.py': '52b413f71510989c83979ba2331c259bd870d403520a8c01c58196aa0f903843',
             'tree/gateway/session_handoff.py': '9cf9e20ca0965dcdd7e5a15887b8e3757a77a23dfcbceef0925feed5bb3edb46',
             'tree/gateway/session_controls.py': 'd4c2b46892ade34603e8803d77cec96a969cbf22ce955b4a5eef0570cdc7e43e',
-            'tree/tests/gateway/test_session_handoff_notice.py': 'b77c54a9d8daf6c945b6a46de7eefc3df8da14a1c3028cca19ee2f7f26ad13c4',
+            'tree/tests/gateway/test_session_handoff_notice.py': 'ef5a544bc68d14d76edbdadee19e2aa34a99b33119ee5ac81acdd84cdb8155f0',
           }
           files = json.load(open('setup-resource-v4-manifest.json'))['files']
           bad = []

@@ -59,7 +59,8 @@ def test_failed_notice_transaction_does_not_advance_seen(authority, monkeypatch)
 
 def test_killed_owner_retains_unknown_and_queued_inputs(authority, tmp_path):
     ensure_session_handoff(authority, 'session')
-    path = str(authority.db.db_path)
+    db_path = authority.db.db_path
+    path = str(db_path)
     authority.db.close()
     code = '''
 import sys
@@ -91,7 +92,7 @@ with SessionDB(Path(sys.argv[1])) as db:
         child.stdin.close()
         child.stdout.close()
         child.stderr.close()
-    authority.db = SessionDB(path)
+    authority.db = SessionDB(db_path)
     old = authority.epoch
     authority.epoch = begin_runtime_epoch(authority.db, instance_id='successor')
     recover_session_inputs(authority.db, epoch=authority.epoch)
