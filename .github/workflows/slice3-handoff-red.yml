@@ -25,16 +25,36 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, hashlib, pathlib, sys
+          declared = {
+            'tree/gateway/run_shutdown.py': '9cf4f2fadab252f5f54c5e06727807ab49dcf8a66b0f6d962906ca10fb6c30ce',
+            'tree/gateway/session_authority.py': '86f748a9f2893ea908adb920f6b9e01c580b33cd3f1e8751d393f1a42025a324',
+            'tree/hermes_state_sessions.py': '6203da385dd0f1f428a3611e9199de306c20fdbd9f86daea938bcfc344390482',
+            'tree/gateway/restart_handoff.py': None,
+            'tree/gateway/session_handoff.py': None,
+          }
           files = json.load(open('setup-resource-v4-manifest.json'))['files']
           bad = []
+          declared_seen = 0
           for e in files:
               p = pathlib.Path(e['path'])
+              if e['path'] in declared:
+                  declared_seen += 1
+                  want = declared[e['path']]
+                  if want is None:
+                      bad.append(('declared-addition-missing', e['path'])); continue
+                  b = p.read_bytes() if p.is_file() else b''
+                  if hashlib.sha256(b).hexdigest() != want:
+                      bad.append(('declared-mismatch', e['path']))
+                  continue
               if not p.is_file():
                   bad.append(('missing', e['path'])); continue
               b = p.read_bytes()
               if len(b) != e['size'] or hashlib.sha256(b).hexdigest() != e['sha256']:
                   bad.append(('mismatch', e['path']))
-          print(f"verified={len(files)} bad={len(bad)}")
+          for extra in [k for k, v in declared.items() if v is None]:
+              if not pathlib.Path(extra).is_file():
+                  bad.append(('missing', extra))
+          print(f"verified={len(files)} declared={declared_seen} bad={len(bad)}")
           for kind, path in bad[:20]:
               print(kind, path)
           sys.exit(1) if bad else sys.exit(0)
