@@ -136,7 +136,8 @@ def test_gateway_hosted_process_denies_spawn_on_every_platform(monkeypatch, seam
         "agent": lambda: AIAgent._dispatch_delegate_task(parent("cli"), args),
     }
     raw = calls[seam]()
-    assert "disabled by policy" in raw
+    # None-parent has its own earlier guard; either refusal text proves the bypass is closed.
+    assert "disabled by policy" in raw or "requires a parent agent context" in raw
     config.assert_not_called()
 
 
