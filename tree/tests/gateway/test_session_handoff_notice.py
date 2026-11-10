@@ -77,7 +77,10 @@ with SessionDB(sys.argv[1]) as db:
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         assert select.select([child.stdout], [], [], 10)[0], 'fixture never claimed'
-        assert child.stdout.readline().strip() == 'CLAIMED'
+        line = child.stdout.readline().strip()
+        assert line == 'CLAIMED', (
+            f'fixture died before claim: rc={child.poll()} '
+            f'stderr={child.stderr.read()!r}')
         child.kill()
         child.wait(timeout=10)
     finally:
