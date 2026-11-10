@@ -26,11 +26,11 @@ jobs:
           python3 - <<'PY'
           import json, hashlib, pathlib, sys
           declared = {
-            'tree/gateway/run_shutdown.py': '9cf4f2fadab252f5f54c5e06727807ab49dcf8a66b0f6d962906ca10fb6c30ce',
-            'tree/gateway/session_authority.py': '86f748a9f2893ea908adb920f6b9e01c580b33cd3f1e8751d393f1a42025a324',
-            'tree/hermes_state_sessions.py': '6203da385dd0f1f428a3611e9199de306c20fdbd9f86daea938bcfc344390482',
-            'tree/gateway/restart_handoff.py': None,
-            'tree/gateway/session_handoff.py': None,
+            'tree/gateway/run_shutdown.py': '423e66be9761ba34c59ff879520a930ea4d4887eb427e821a96ffaa893cd2bf0',
+            'tree/gateway/session_authority.py': '4aa7b41b511583c0ffd6968d80a5b5369456106c2522b01504637621aab1d41c',
+            'tree/hermes_state_sessions.py': '2234276fe7dab15c85eaad9bd8ac7b9830112b1e364418a19350af98b7d1b148',
+            'tree/gateway/restart_handoff.py': '52b413f71510989c83979ba2331c259bd870d403520a8c01c58196aa0f903843',
+            'tree/gateway/session_handoff.py': '9cf9e20ca0965dcdd7e5a15887b8e3757a77a23dfcbceef0925feed5bb3edb46',
           }
           files = json.load(open('setup-resource-v4-manifest.json'))['files']
           bad = []
