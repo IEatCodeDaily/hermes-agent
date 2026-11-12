@@ -40,6 +40,7 @@ class TurnRetryState:
     llama_cpp_grammar_retry_attempted: bool = False
 
     # Transport / rate-limit recovery
+    provider_reset_deadline: float | None = None
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
     # Credit-limited 402 ("can only afford N tokens") already retried with a lowered output cap.

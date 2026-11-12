@@ -142,6 +142,15 @@ def handle_api_error(
         reason=classified.reason.value,
     )
 
+    # A declared reset is a parked attempt, not a failed retry. Do this before
+    # credential rotation/fallback and before incrementing the eight-attempt budget.
+    from agent.turn_provider_reset import wait_for_provider_reset
+    _reset_context = {**(error_context or {}), **(classified.error_context or {})}
+    _parked = wait_for_provider_reset(agent, api_error, classified, _reset_context, _retry,
+        messages=messages, conversation_history=conversation_history, api_call_count=api_call_count)
+    if _parked is not None:
+        return _verdict(*_parked)
+
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
         messages=messages, api_messages=api_messages,
