@@ -21,6 +21,9 @@ class CanonicalSessionParams(ProfileParams):
 class CanonicalCreateParams(ProfileParams):
     request_id: str | None = None
     source: Literal['cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'] = 'cli'
+    # A T3 Code delegate_task child (the ACP relay's thread is a subagent): its runs fail
+    # fast on provider limits instead of parking; carried on the frozen launch config.
+    t3_delegated: bool = False
     cwd: str | None = None
     # The sessions-row ``cwd`` when it differs from the execution ``cwd`` (the classic CLI records
     # main's stamp: the launch dir, ``""`` = none); ``cwd`` stays where the tools run.

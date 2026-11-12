@@ -275,6 +275,9 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
                 {**json.loads(policy.request_json), 'model_requested': raw_model, 'route_derived': derived},
                 sort_keys=True))
         marks = {LOCAL_DESKTOP_CHAT: True} if desktop_local and policy.source == 'gui' else {}
+        # A T3 delegate child never parks on a provider limit (fails fast to the parent).
+        if params.pop('t3_delegated', False) is True:
+            marks[T3_DELEGATED] = True
         if policy.model is None:
             from hermes_cli.anon_auth import GUEST_MODEL
             policy = replace(policy, model=_resolve_gateway_model(policy.config()) or None)

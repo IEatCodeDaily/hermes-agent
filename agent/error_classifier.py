@@ -1000,8 +1000,9 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
     # evidence wins over the outer transport status; a bare 5xx stays transport.
     if 500 <= status < 600 and ('[429]' in c.msg or 'rate_limit_error' in c.msg):
         reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
-        return _v(_R.rate_limit, **_ROTATE_FALLBACK,
-                  error_context={'reset_at': time.time() + reset} if reset else {})
+        ctx = {'reset_at': time.time() + reset} if reset else {}
+        ctx.update(_structured_limit_context(c.body))
+        return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context=ctx)
     default = _V_FORMAT_ERROR if 400 <= status < 500 else _V_SERVER_ERROR if 500 <= status < 600 else None
     return _STATUS_HANDLERS[status](c) if status in _STATUS_HANDLERS else default
 
@@ -1127,7 +1128,9 @@ def _status_429(c: _Ctx) -> Verdict:
     # Carry the reset window so the terminal copy can name it instead of "wait a minute" (#89401).
     reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
     if reset:
-        return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
+        return _v(_R.rate_limit, **_ROTATE_FALLBACK,
+                  error_context={'reset_at': time.time() + reset,
+                                 **_structured_limit_context(c.body)})
     return _V_RATE_LIMIT
 
 
@@ -1328,6 +1331,21 @@ def _has_usage_limit_transient_signal(error_msg: str, body: dict, response_heade
     if response_headers and hasattr(response_headers, "get"):
         return any(response_headers.get(h) not in (None, "") for h in _RESET_HEADERS)
     return False
+
+
+def _structured_limit_context(body) -> dict:
+    """Structured provider-limit fields for the park/child errors: 9router ships
+    ``code`` + ``reset_at`` + ``scope`` (soonest reset for combos); pass what is present."""
+    payload = body if isinstance(body, dict) else {}
+    err = payload.get('error') if isinstance(payload.get('error'), dict) else {}
+    out: dict = {}
+    for src in (payload, err):
+        for key in ('limit_kind', 'limit_scope', 'scope'):
+            if src.get(key) and key not in out:
+                out[key] = src[key]
+        if src.get('code') and 'limit_code' not in out:
+            out['limit_code'] = src['code']
+    return out
 
 
 def _rate_limit_reset_seconds(error_msg: str, body: dict, response_headers) -> Optional[float]:

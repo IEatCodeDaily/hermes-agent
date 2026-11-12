@@ -41,6 +41,9 @@ class TurnRetryState:
 
     # Transport / rate-limit recovery
     provider_reset_deadline: float | None = None
+    # Open provider-limit park episode: keys started/provider/model, then resumed=True.
+    # Drives the exactly-once park and resume notices (turn_provider_reset).
+    provider_limit_episode: dict | None = None
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
     # Credit-limited 402 ("can only afford N tokens") already retried with a lowered output cap.
