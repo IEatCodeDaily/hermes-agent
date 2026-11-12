@@ -1745,6 +1745,11 @@ def _run_conversation_turn(
         if early_result is not None:
             return early_result
 
+        # The call succeeded: a provider-limit park episode opened earlier in this
+        # iteration closes here, with its one resume notice.
+        from agent.turn_provider_reset import close_provider_limit_episode
+        close_provider_limit_episode(agent, s._retry)
+
         _rs = _run_phase(apply_retry_restarts, agent, s)
         if _rs.action == "break":
             break
