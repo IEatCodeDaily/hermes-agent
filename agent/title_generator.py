@@ -295,6 +295,13 @@ def _summarize_user_message(user_message: str) -> str:
     """Text worth titling: describe a ``/skill`` invocation (it embeds the whole skill body), then strip wrappers."""
     if not user_message:
         return ""
+    # Editor clients (T3 Code) wrap the request in long instruction blocks; title the request itself.
+    request = re.search(r"<user_request>\s*(.*?)\s*</user_request>", user_message, re.DOTALL)
+    if request and request.group(1).strip():
+        user_message = request.group(1)
+    # T3 Code prefixes a context handoff (withInlineContext) before the user's own text.
+    if user_message.startswith("Context handoff ("):
+        user_message = user_message.rpartition("\n\nUser message:\n")[2] or user_message
     described = None
     try:
         from agent.skill_commands import describe_skill_invocation

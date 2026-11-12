@@ -42,6 +42,16 @@ class TestGenerateTitle:
         lead = paste_preview if instruction.startswith("@file:") else instruction
         assert derive_title(instruction, paste_preview).startswith(lead[:12])
 
+    @pytest.mark.parametrize("message", [
+        "<t3_code_instructions>\nMode: Default\n</t3_code_instructions>\n\n<user_request>\nFix the login redirect\n</user_request>",
+        "Context handoff (full_thread_summary):\nFrom thread t1, runs 1-3.\n\nUser message:\nFix the login redirect",
+        "<t3_code_instructions>\nx\n</t3_code_instructions>\n\n<user_request>\nContext handoff (fork_delta_summary):\n"
+        "From thread t1.\n\nUser message:\nFix the login redirect\n</user_request>",
+    ])
+    def test_editor_wrappers_and_t3_handoff_header_are_not_titled(self, message):
+        assert build_title_input(message) == "Fix the login redirect"
+        assert derive_title(message) == "Fix the login redirect"
+
     def test_expanded_paste_ref_footer_does_not_demote_the_preview(self):
         """The titler receives the opener AFTER @-reference expansion: the generated ref carries a
         `--- Context Warnings ---` (or `--- Attached Context ---`) footer, which must not turn a
