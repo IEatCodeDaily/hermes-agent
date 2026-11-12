@@ -27,6 +27,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
+from gateway.agent_trace_emit import _shutdown_agent_trace_plane
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
@@ -36,18 +37,11 @@ from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_wa
 logger = logging.getLogger("gateway.run")
 
 
-def _exit_with_failure_verdict(runner) -> bool:
-    """True (after logging the reason) when the runner asked for a failure exit."""
-    if not runner.should_exit_with_failure:
-        return False
-    if runner.exit_reason:
-        logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-    return True
-
-
 def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bool:
     """Resolve the process verdict after either startup abort or normal shutdown."""
-    if _exit_with_failure_verdict(runner):
+    if runner.should_exit_with_failure:
+        if runner.exit_reason:
+            logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
@@ -1624,10 +1618,18 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             )
             return False
         timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
+        handoff = getattr(self, "_restart_handoff", None)
+        clamped_by_handoff = False
+        if handoff is not None:  # never let this phase consume the stop's share of the one deadline
+            clamped = handoff.phase_budget(timeout, reserve=handoff.stop_budget)
+            clamped_by_handoff = handoff is not None and clamped < timeout
+            timeout = clamped
         if timeout <= 0:
             logger.info(
-                "Restart requested with %d active work unit(s); "
-                "restart_after_turn_timeout=0 — entering stop()/drain immediately", active,
+                "Restart requested with %d active work unit(s); %s — entering stop()/drain immediately",
+                active,
+                "handoff deadline leaves no after-turn budget" if clamped_by_handoff
+                else "restart_after_turn_timeout=0",
             )
             return False
         logger.info(
@@ -1682,6 +1684,14 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._draining = True
         from gateway.drain_control import open_restart_wait
         open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
+        # ONE handoff deadline armed at restart admission: covers the after-turn wait, stop drain
+        # and teardown in a single monotonic bound, with a thread watchdog hard-exiting a wedged
+        # loop. Duplicate restart requests reuse this context and can never extend it.
+        from gateway.restart_handoff import begin as begin_restart_handoff
+        from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+        begin_restart_handoff(
+            self, stop_budget=resolve_shutdown_watchdog_delay(
+                float(getattr(self, "_stop_drain_timeout", 0.0) or 0.0)), arm=True)
         # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
         # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
         self._mark_api_runs_shutdown_requested()
@@ -1694,6 +1704,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     await self._launch_detached_restart_command()
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            handoff = getattr(self, "_restart_handoff", None)
+            if handoff is not None:  # clean exit reached: the watchdog must not fire on the way out
+                handoff.disarm()
 
         # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
         # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in
@@ -2111,6 +2124,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         releases PID/lock ownership after the writer drain."""
         from gateway.run import _hermes_home, _planned_restart_notification_path, _shutdown_gateway_health_export
         from utils import atomic_json_write
+        await _shutdown_agent_trace_plane(self)
         if getattr(self, "_startup_cleanup_only", False):  # start never ran: keep startup_failed + crash markers
             return _shutdown_gateway_health_export(self)
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
@@ -2222,6 +2236,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
         finally:
+            await _shutdown_agent_trace_plane(self)
             _watchdog_done.set()
 
     async def stop(

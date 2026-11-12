@@ -119,8 +119,11 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
 
 
 def start_turn_worker(runner, worker, agent_holder, run_sync):
+    from gateway.agent_trace_emit import bind_execution_owner
     authority = track_turn_worker(runner, worker, agent_holder)
-    worker.executor_task = asyncio.ensure_future(runner._run_in_executor_with_context(run_sync))
+    # Bind before task creation: the executor inherits this captured generation fence.
+    with bind_execution_owner(worker.is_current):
+        worker.executor_task = asyncio.ensure_future(runner._run_in_executor_with_context(run_sync))
     if authority is not None:
         # Normal settlement releases the retained agent promptly. A cancelled asyncio waiter is
         # not physical completion; leave that entry until worker_done proves the thread exited.

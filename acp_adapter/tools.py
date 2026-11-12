@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
@@ -808,10 +809,18 @@ def _build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edi
     else:  # unknown tool with arguments: echo them as content and raw_input
         content = [_text(_args_json(arguments))]
         raw_input = arguments
-    return acp.start_tool_call(
+    update = acp.start_tool_call(
         tool_call_id, build_tool_title(tool_name, arguments), kind=get_tool_kind(tool_name),
         content=content, locations=extract_locations(arguments), raw_input=raw_input,
     )
+    if tool_name.startswith("mcp__"):
+        server, separator, native_name = tool_name[5:].partition("__")
+        if separator and server and native_name:
+            # Editor discovery adds a session suffix for execution isolation; clients need
+            # the original server identity, not that private registry alias, for rendering.
+            editor = re.fullmatch(r"editor_(.+)_[0-9a-f]{8}", server)
+            update.field_meta = {"serverId": editor[1] if editor else server, "toolName": native_name}
+    return update
 
 
 def build_tool_complete(
@@ -826,11 +835,24 @@ def build_tool_complete(
         content = [_text(error_text)] if error_text else None
     else:
         content = _build_tool_complete_content(tool_name, result, function_args=function_args, snapshot=snapshot)
-    structured = isinstance(_json_loads_maybe(result), (dict, list))
+    data = _json_loads_maybe(result)
+    structured = isinstance(data, (dict, list))
+    failed = is_error or _tool_result_failed(result, tool_name)
+    raw_output = None if tool_name in _POLISHED_TOOLS or structured else result
+    if tool_name.startswith("mcp_"):
+        # MCP clients consume attachment/operation metadata, not the Markdown summary above.
+        # Restore the CallToolResult envelope flattened by tools.mcp_tool_handlers.
+        text = data.get("result", result) if isinstance(data, dict) else result
+        raw_output = {"content": [{"type": "text", "text": text if isinstance(text, str) else json.dumps(text)}],
+                      "isError": failed}
+        if isinstance(data, dict):
+            for key in ("structuredContent", "_meta"):
+                if key in data:
+                    raw_output[key] = data[key]
     return acp.update_tool_call(
         tool_call_id, kind=get_tool_kind(tool_name),
-        status="failed" if is_error or _tool_result_failed(result, tool_name) else "completed", content=content,
-        raw_output=None if tool_name in _POLISHED_TOOLS or structured else result,
+        status="failed" if failed else "completed", content=content,
+        raw_output=raw_output,
     )
 
 

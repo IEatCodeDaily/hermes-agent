@@ -470,6 +470,8 @@ def _connection_identity(config: dict) -> tuple:
     def _frozen(value):
         return json.dumps(value or {}, sort_keys=True, default=str)
 
+    if config.get("transport") == "acp":
+        return ("acp", config["_acp_ref"], config["server_id"])
     return (config_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
             _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")),
             config.get("ssl_verify", True), bool(config.get("strict_redirect_headers")))
@@ -495,7 +497,7 @@ def _adopter_identity_digest(server_name: str, config: dict) -> str | None:
     sentinel: no connectable config, no live endpoint, or a resolver failure."""
     from tools.mcp_tool_transport import LiveEndpointUnavailable, _connect_inputs
 
-    if "url" not in config and not config.get("command"):  # the transport refuses it before resolving
+    if config.get("transport") != "acp" and "url" not in config and not config.get("command"):
         return None
     try:
         inputs, _ = _connect_inputs(server_name, config)

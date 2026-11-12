@@ -94,6 +94,8 @@ class TurnFacadeMixin:
                     "cancelled" if admission.early_result.get("interrupted") else "timed_out"
                 )
                 return admission.early_result
+            # Admission may resolve a rotated resume tip; freeze it before mutable turn work.
+            session_id = str(task_context["session_id"])
             lease = admission.lease
             conversation_history = admission.conversation_history
 
@@ -145,17 +147,21 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
-                    result = run_conversation(
-                        self, user_message, system_message, conversation_history, effective_task_id,
-                        stream_callback, persist_user_message,
-                        persist_user_timestamp=persist_user_timestamp,
-                        persist_user_display_kind=persist_user_display_kind,
-                        persist_user_display_metadata=persist_user_display_metadata,
-                        persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
-                        turn_author=turn_author,
-                        title_user_message=title_user_message,
-                        prelude=prelude,
-                    )
+                    # Both hosted ACP and messaging runners enter this admitted execution owner.
+                    from gateway.agent_trace_emit import trace_execution
+                    with trace_execution(self, session_id, relay_turn_id) as execution_trace:
+                        result = run_conversation(
+                            self, user_message, system_message, conversation_history, effective_task_id,
+                            stream_callback, persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            persist_user_display_metadata=persist_user_display_metadata,
+                            persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                            turn_author=turn_author,
+                            title_user_message=title_user_message,
+                            prelude=prelude,
+                        )
+                        execution_trace.result = result
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.

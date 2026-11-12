@@ -755,7 +755,11 @@ def _dispatch_authorized_once(
     from tools.connectors.data_use import collect_data_use
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
         try:
-            return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+            from gateway.agent_trace_emit import trace_tool
+            with trace_tool(ref.call_id, ref.name) as tool_trace:
+                result = _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+                tool_trace.result = result
+                return result
         finally:
             state.data_use = frozenset(data_use)
 

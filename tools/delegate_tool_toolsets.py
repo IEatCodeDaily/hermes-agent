@@ -113,7 +113,11 @@ def _resolve_child_toolsets(
     inherited_disabled = (
         [str(name) for name in raw_parent_disabled] if isinstance(raw_parent_disabled, (list, tuple, set)) else []
     )
-    if effective_role == "orchestrator":
+    from toolsets import native_delegate_refusal
+    denied = native_delegate_refusal(parent_agent) is not None
+    if denied and "delegation" not in inherited_disabled:
+        inherited_disabled.append("delegation")
+    if effective_role == "orchestrator" and not denied:
         inherited_disabled = [name for name in inherited_disabled if name != "delegation"]
         if "delegation" not in child_toolsets:
             child_toolsets.append("delegation")

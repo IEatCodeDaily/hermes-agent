@@ -301,8 +301,11 @@ async def connect_gateway(endpoint=None, subject=None):
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
+        # ponytail: keepalive ping_timeout 20s -> 300s. The owner's event loop can stall for tens of seconds
+        # (sync SQLite/lock waits on slow disk) and websockets' 20s default then kills a healthy loopback link
+        # with 1011, losing the turn as "outcome unknown". A dead owner still closes the socket at once.
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
-                           proxy=None) as ws:
+                           proxy=None, ping_timeout=300) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:

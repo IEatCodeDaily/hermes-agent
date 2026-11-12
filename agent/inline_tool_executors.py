@@ -43,6 +43,7 @@ def emit_terminal_post_tool_call(
     middleware_trace: Optional[list] = None,
 ) -> None:
     """Emit the one terminal ``post_tool_call`` hook for a tool_call_id (best-effort)."""
+    # Tracing observes real dispatch, not this post hook (also fired for blocked/skipped calls).
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(

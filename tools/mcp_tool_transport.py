@@ -143,6 +143,8 @@ def _connect_inputs(server_name: str, config: dict) -> tuple[list, set]:
     header. The owner hashes this very list and an adopter recomputes it, so both digests are
     built from one code path. Also returns the configured header names (HTTP only), captured
     before the identity header is merged in, for the strict-redirect boundary."""
+    if config.get("transport") == "acp":
+        return ["acp", config["_acp_ref"], config["server_id"]], set()
     if "url" in config:
         url, headers = _http_endpoint(server_name, config)
         configured_header_names = {key.lower() for key in headers}
@@ -299,6 +301,14 @@ class MCPServerTransportMixin:
                     return await self._serve_session(session, connect_timeout, label)
         except BaseExceptionGroup as _eg:
             return self._reconnect_or_reraise_group(_eg)
+
+    async def _run_acp(self, config):
+        from acp_adapter.mcp_tunnel import acp_transport
+        inputs, _ = _connect_inputs(self.name, config)
+        self._resolved_identity = _registration._identity_digest(inputs)
+        return await self._serve_transport(
+            acp_transport(config["_acp_ref"], config["server_id"]), "ACP",
+            float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)))
 
     # ------------------------------------------------------------------ stdio
 

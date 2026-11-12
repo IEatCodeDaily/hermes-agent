@@ -40,3 +40,65 @@ def test_unsubscribe_stops_delivery():
     em.flush()
     em.close()
     assert [ev["name"] for ev in seen] == ["a"]
+
+
+def test_replacement_subscription_never_receives_old_queued_or_captured_work():
+    import threading
+
+    em = MonitoringEmitter()
+    entered, release = threading.Event(), threading.Event()
+    old, new, health = [], [], []
+
+    def stalled(batch):
+        entered.set()
+        assert release.wait(5)
+
+    previous = lambda batch: old.extend(batch)
+    replacement = lambda batch: new.extend(batch)
+    em.subscribe(stalled)
+    em.subscribe(previous)
+    try:
+        em.emit({"name": "captured"})
+        assert entered.wait(2)
+        em.emit({"name": "queued"})
+        em.unsubscribe(previous)
+        em.subscribe(replacement)
+        em.subscribe(lambda batch: health.extend(batch))
+        release.set()
+        em.flush()
+        assert not old and not new and not health
+        em.emit({"name": "fresh"})
+        em.flush()
+        assert [item["name"] for item in new] == ["fresh"]
+        assert [item["name"] for item in health] == ["fresh"]
+    finally:
+        release.set()
+        em.close()
+
+
+def test_last_detach_reuses_bus_without_replaying_old_generation():
+    import threading
+
+    em = MonitoringEmitter()
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def previous(batch):
+        entered.set()
+        assert release.wait(5)
+
+    em.subscribe(previous)
+    try:
+        em.emit({"name": "inflight"})
+        assert entered.wait(2)
+        em.emit({"name": "old"})
+        em.unsubscribe(previous)
+        em.subscribe(lambda batch: seen.extend(batch))
+        release.set()
+        em.emit({"name": "new"})
+        em.flush()
+        assert [item["name"] for item in seen] == ["new"]
+        assert em._thread.is_alive()
+    finally:
+        release.set()
+        em.close()

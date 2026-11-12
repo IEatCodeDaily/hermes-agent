@@ -70,7 +70,7 @@ TITLE_MAX_TOKENS = 512
 # rendered from these constants so the guard set and the prompt cannot drift
 # apart. Port of QwenLM/qwen-code#9709.
 _PROMPT_GOOD_EXAMPLES = (
-    "Fix login button on mobile",
+    "Fix mobile login button",
     "Postgres connection pool exhaustion",
     "Friendly greeting",
 )
@@ -97,7 +97,7 @@ _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a title "
     "that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
-    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
+    "- 2 to 4 words, sentence case (capitalize only the first word and proper nouns).\n"
     "- Name what the user wants DONE, not that they asked a question.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
     "- Drop filler words: the, this, my, a, an.\n"
@@ -190,6 +190,9 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     Running the title call after the turn settles keeps the two requests off the wire at once.
     Hosted providers multiplex requests independently and keep the turn-start timing.
     """
+    if os.environ.get("HERMES_TITLE_CONCURRENT", "").lower() in ("1", "true", "yes") or str(
+            _title_config().get("concurrent", "")).lower() in ("1", "true", "yes"):
+        return False  # endpoint multiplexes (routing proxy); title may run alongside the turn
     provider = str((main_runtime or {}).get("provider") or "").strip().lower()
     if not _is_self_hosted_provider(provider):
         return False
@@ -295,6 +298,10 @@ def _summarize_user_message(user_message: str) -> str:
     """Text worth titling: describe a ``/skill`` invocation (it embeds the whole skill body), then strip wrappers."""
     if not user_message:
         return ""
+    # Editor clients (T3 Code) wrap the request in long instruction blocks; title the request itself.
+    request = re.search(r"<user_request>\s*(.*?)\s*</user_request>", user_message, re.DOTALL)
+    if request and request.group(1).strip():
+        user_message = request.group(1)
     described = None
     try:
         from agent.skill_commands import describe_skill_invocation

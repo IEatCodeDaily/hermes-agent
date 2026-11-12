@@ -332,6 +332,21 @@ _INHERIT_PARENT_ROUTING_SQL = (
 )
 
 
+
+def _delete_session_handoff_meta(conn, session_ids) -> None:
+    """Handoff identity dies with the session: exact seen key + escaped per-epoch records.
+
+    LIKE is escaped because local session ids derive from chat ids and can carry
+    ``%``/``_``; an unescaped pattern would sweep a sibling id's handoff records.
+    """
+    for sid in set(session_ids or ()):
+        pattern = "session_handoff_v1:" + (
+            sid.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")) + ":%"
+        conn.execute(
+            "DELETE FROM state_meta WHERE key = ? OR (key LIKE ? ESCAPE '\\')",
+            ("session_handoff_seen_v1:" + sid, pattern))
+
+
 class SessionSessionsMixin:
     """Session rows: create/inherit, lifecycle flags, model_config, listing, deletion."""
 
@@ -1770,11 +1785,13 @@ class SessionSessionsMixin:
                 return False
             from hermes_state_mutation_retirement import retire_sessions
             retire_sessions(conn, scope)
-            removed_ids.extend(_delete_delegate_children(conn, scope))
+            removed_child_ids = _delete_delegate_children(conn, scope)
+            removed_ids.extend(removed_child_ids)
             for sid in scope:  # orphan remaining children (branches) so FK is satisfied
                 conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (sid,))
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
             conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in scope])
+            _delete_session_handoff_meta(conn, [*scope, *removed_child_ids])
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(scope)
             return True
@@ -1915,7 +1932,8 @@ class SessionSessionsMixin:
                 expanded = expand(existing)
             from hermes_state_mutation_retirement import retire_sessions
             retire_sessions(conn, expanded)
-            removed_ids.extend(_delete_delegate_children(conn, expanded))
+            removed_child_ids = _delete_delegate_children(conn, expanded)
+            removed_ids.extend(removed_child_ids)
             for chunk in _id_chunks(expanded):
                 ph = _session_ids_placeholders(chunk)
                 conn.execute(  # orphan children whose parent is in the kill list (FK)
@@ -1923,6 +1941,7 @@ class SessionSessionsMixin:
                 )
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+            _delete_session_handoff_meta(conn, [*expanded, *removed_child_ids])
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(expanded)
             # Count the ids the CALLER asked for, not the expanded chain links —

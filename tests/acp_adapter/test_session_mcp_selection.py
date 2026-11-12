@@ -26,7 +26,8 @@ def test_a_broken_editor_server_is_left_out_of_the_session(server_spec, tmp_path
     authority = owner()
     started = time.monotonic()
     p = _policy(authority, 'mixed', [silent, server_spec], tmp_path)
-    assert time.monotonic() - started < 25
+    # Discovery allows 30s under memory pressure, plus bounded teardown.
+    assert time.monotonic() - started < 45
     started = time.monotonic()
     with policy_scope(p, authority=authority):
         names = _editor_tools()

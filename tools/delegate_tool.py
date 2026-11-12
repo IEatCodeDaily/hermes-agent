@@ -234,6 +234,9 @@ def _build_child_agent(
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
     see ``_ChildRun.await_child``) the child inside that profile's scope; it never shares the parent's pool."""
+    from toolsets import native_delegate_refusal
+    if refusal := native_delegate_refusal(parent_agent):
+        raise ValueError(refusal)
     import uuid as _uuid
     from run_agent import AIAgent
     from agent.delegation_context import delegated_child_context
@@ -568,6 +571,11 @@ def delegate_task(
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
+    # Shared boundary: registry, direct API and agent-loop calls all arrive here.
+    from toolsets import native_delegate_refusal
+    if refusal := native_delegate_refusal(parent_agent):
+        return tool_error(refusal)
+
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
         return tool_error(
@@ -850,6 +858,26 @@ DELEGATE_TASK_SCHEMA = {
             ),
         },
         "required": [],
+    },
+}
+
+
+# Editor-hosted sessions retain the existing ownership-scoped control route,
+# eagerly exposed even when native spawning is configured deferred.
+DELEGATE_CONTROL_SCHEMA = {
+    "name": "delegate_task",
+    "description": ("Observe/control already-owned Hermes-native children only. New native spawning is disabled; "
+                    "delegate new work through the editor's namespaced tool. list returns live children; "
+                    "steer queues guidance; stop requests cooperative interruption and preserves partial results."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": _p("string", "Control an existing child.", enum=["list", "steer", "stop"]),
+            "subagent_id": DELEGATE_TASK_SCHEMA["parameters"]["properties"]["subagent_id"],
+            "message": DELEGATE_TASK_SCHEMA["parameters"]["properties"]["message"],
+        },
+        "required": ["action"],
+        "additionalProperties": False,
     },
 }
 

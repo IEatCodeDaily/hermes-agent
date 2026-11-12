@@ -1327,7 +1327,16 @@ def _render_skills_index(
         return ""
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
-    demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
+    if available_tools is not None and not isinstance(available_tools, (set, frozenset)):
+        available_tools = set(available_tools)  # Callers pass lists (e.g. valid_tool_names snapshots).
+    tools_known = available_tools is not None
+    searchable = tools_known and {"skills_list", "skill_view"} <= available_tools
+    # Posture demotion needs recoverable metadata: both tools present, OR tool context unknown
+    # (fail open — the historical behavior pinned by test_prompt_size's breakdown contract).
+    can_demote = searchable or not tools_known
+    demoted = frozenset(cat for cat in skills_by_category
+                        if can_demote and cat.split("/", 1)[0] in (compact_categories or frozenset()))
+
     hidden_note = (
         "\n(Categories marked [names only] are outside the current coding "
         "context, so their descriptions are omitted — the skills work "
@@ -1345,6 +1354,9 @@ def _render_skills_index(
         if category in demoted:
             index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
             continue
+        if searchable:
+            index_lines.append(f"  {category} [names only]: " + ", ".join(sorted({name for name, _ in entries})))
+            continue
         cat_desc = category_descriptions.get(category, "")
         index_lines.append(f"  {category}: {cat_desc}" if cat_desc else f"  {category}:")
         seen = set()
@@ -1352,12 +1364,27 @@ def _render_skills_index(
             if name not in seen:
                 seen.add(name)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
+    discovery_note = (
+        "\nDescriptions are available through skills_list(query=task_keywords); this searches installed "
+        "metadata, not the hub. Search short task/domain terms and alternate words. After zero matches, "
+        "has_more, uncertainty, or a search that fails, call skills_list with NO arguments at all — no "
+        "query and no category — before deciding no skill applies. If listing fails, do not infer "
+        "absence; report the discovery failure. Listing includes loadable guidance beyond this "
+        "session's tool/channel relevance; check each description and requirements, then load every "
+        "relevant skill with skill_view. Never skip mandatory safety or workflow guidance.\n"
+    ) if searchable else ""
+    if searchable and any(name == "hermes-agent" for entries in skills_by_category.values() for name, _ in entries) \
+            and not any(name.strip() == "hermes-agent" for line in index_lines if "[names only]:" in line
+                        for name in line.split("[names only]:", 1)[1].split(",")):
+        # Preserve the system prompt's existing Hermes-help pointer contract; skip when the
+        # names-only row above already lists hermes-agent (no duplicate row).
+        index_lines.append("    - hermes-agent: Hermes configuration, operation and development guidance.")
     from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
     if is_single_query_session():
         return (
             ONESHOT_SKILLS_LOAD_GUIDANCE
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
-            + hidden_note
+            + hidden_note + discovery_note
         )
     return (
         "## Skills\n"
@@ -1378,7 +1405,7 @@ def _render_skills_index(
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
         "Only proceed without loading a skill if genuinely none are relevant to the task."
-        + hidden_note
+        + hidden_note + discovery_note
     )
 
 
@@ -1405,8 +1432,9 @@ def _build_skills_system_prompt_inner(
     files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _build_skills_manifest(d).items()}
     cache_key = (
         str(skills_dir), tuple((t, str(d)) for t, d in extra_roots), files,
-        tuple(sorted(str(t) for t in (available_tools or set()))),
-        tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
+        # None (unknown tool context, fail-open demotion) must not collide with set() (known-empty).
+        None if available_tools is None else tuple(sorted(str(t) for t in available_tools)),
+        None if available_toolsets is None else tuple(sorted(str(ts) for ts in available_toolsets)),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
         _oneshot_prompt_variant(), tuple(plugin_rows),
     )

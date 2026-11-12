@@ -996,6 +996,12 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
     status = c.status_code
     if status is None:
         return None
+    # Relays can wrap an upstream throttle in 503. Explicit upstream rate-limit
+    # evidence wins over the outer transport status; a bare 5xx stays transport.
+    if 500 <= status < 600 and ('[429]' in c.msg or 'rate_limit_error' in c.msg):
+        reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+        return _v(_R.rate_limit, **_ROTATE_FALLBACK,
+                  error_context={'reset_at': time.time() + reset} if reset else {})
     default = _V_FORMAT_ERROR if 400 <= status < 500 else _V_SERVER_ERROR if 500 <= status < 600 else None
     return _STATUS_HANDLERS[status](c) if status in _STATUS_HANDLERS else default
 

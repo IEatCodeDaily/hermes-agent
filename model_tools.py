@@ -300,7 +300,9 @@ def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, 
                         name, ", ".join(resolved) if resolved else "none",
                     )
             else:
-                resolved = resolve_toolset(name)
+                # Native delegation policy is exact-name only: an MCP server
+                # aliasing this toolset must retain its namespaced tools.
+                resolved = resolve_toolset(name, include_registry=False) if disable and name == "delegation" else resolve_toolset(name)
         elif name in _LEGACY_TOOLSET_MAP:
             label = f"{verb} legacy toolset"
             resolved = _LEGACY_TOOLSET_MAP[name]

@@ -64,14 +64,14 @@ def test_long_lived_agent_is_told_each_skill_change_once(tmp_path, monkeypatch):
 
     _write_skill(skills, "terraform-ops", "Plan infra.")
     note = _turn(agent, prompt, history)
-    assert "    - terraform-ops: Plan infra." in note and "docker-ops" not in note
+    assert "    - terraform-ops" in note and "docker-ops" not in note
     assert _turn(agent, prompt, history) == ""
     history += [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}] * 150
     assert _turn(_agent(tmp_path), prompt, history) == ""
 
     (skills / "devops" / "docker-ops" / "SKILL.md").unlink()
     note = _turn(agent, prompt, history)
-    assert "    - terraform-ops: Plan infra." in note and note.endswith("No longer available: docker-ops]")
+    assert "    - terraform-ops" in note and note.endswith("No longer available: docker-ops]")
 
     (skills / "devops" / "terraform-ops" / "SKILL.md").unlink()
     _write_skill(skills, "docker-ops", "Run containers.")

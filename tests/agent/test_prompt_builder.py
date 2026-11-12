@@ -289,8 +289,14 @@ class TestBuildSkillsSystemPrompt:
         # Nested category ("social-media/twitter") demoted via its parent:
         # name visible, description gone.
         compact = build_skills_system_prompt(
-            compact_categories=frozenset({"social-media"})
+            compact_categories=frozenset({"social-media"}),
+            available_tools={"skills_list", "skill_view"},
         )
+        # Explicitly missing a recovery tool must retain descriptions, even in focus mode.
+        for tools in [None, {"skills_list"}, {"skill_view"}]:
+            assert "Write threads" in build_skills_system_prompt(
+                compact_categories=frozenset({"social-media"}), available_tools=tools)
+
         assert "thread-writer" in compact
         assert "Write threads" not in compact
         # Unfiltered call must not be served from the compacted cache entry.

@@ -1342,6 +1342,8 @@ class AIAgent(
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch; new DELEGATE_TASK_SCHEMA fields are added only here."""
+        # Spawn policy is enforced by the shared native implementation; owned
+        # list/steer/stop actions must reach its existing authorization checks.
         from tools.delegate_tool import _strip_model_hidden_task_fields, delegate_task as _delegate_task
         # Top-level MODEL delegations always run in the background (handle returned, results re-enter as
         # messages). An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and

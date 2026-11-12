@@ -38,8 +38,10 @@ def _resolve_refresh_toolsets(agent, enabled_override, disabled_override):
     if enabled_override is not None or disabled_override is not None:
         enabled = enabled_override if enabled_override is not None else enabled
         if disabled_override is not None:
-            from toolsets import session_disabled_toolsets
-            disabled = session_disabled_toolsets(disabled_override, getattr(agent, "platform", None))
+            from toolsets import native_delegate_refusal, session_disabled_toolsets
+            disabled = session_disabled_toolsets(
+                disabled_override, getattr(agent, "platform", None),
+                native_delegate_denied=native_delegate_refusal(agent) is not None)
         agent.enabled_toolsets, agent.disabled_toolsets = enabled, disabled
     return enabled, disabled
 
@@ -55,11 +57,14 @@ def _tool_defs_content_changed(agent, new_defs: list) -> bool:
 
 
 def _drop_session_tools(agent, new_defs: list, new_names: set) -> tuple:
-    from toolsets import agent_tool_drops
+    from toolsets import agent_tool_drops, native_delegate_control_tools, native_delegate_refusal
     drops = agent_tool_drops(agent)
-    if not drops:
-        return new_defs, new_names
-    return [entry for entry in new_defs if _def_name(entry) not in drops], new_names - drops
+    if native_delegate_refusal(agent) is not None:
+        # Replace the builtin in its existing slot; removing it first moves the prefix.
+        drops = drops - {"delegate_task"}
+    new_defs = native_delegate_control_tools(agent, [entry for entry in new_defs if _def_name(entry) not in drops])
+
+    return new_defs, {_def_name(entry) for entry in new_defs}
 
 
 def _publish_tool_snapshot(
@@ -81,9 +86,10 @@ def _publish_tool_snapshot(
         new_defs, new_names = _drop_session_tools(agent, new_defs, new_names)
         # Record the generation even when unchanged so an in-flight older caller can't clobber.
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-        # Same name set: nothing to publish, unless the caller is content_aware
-        # (explicit reload, compaction) and the serialized schema bytes moved.
-        if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
+        from toolsets import native_delegate_control_tools
+        policy_changed = native_delegate_control_tools(agent, current_defs) != current_defs
+        # A restrictive policy replacement must publish even with unchanged names.
+        if new_names == current and not policy_changed and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
             return None
         agent.tools = new_defs
         agent.valid_tool_names = new_names

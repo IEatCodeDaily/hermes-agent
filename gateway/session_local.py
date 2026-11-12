@@ -236,7 +236,7 @@ def staged_creation_follows(authority, actor, request_id):
 
 
 def stage_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None, skills_prompt=None,
-                        client_local=False, desktop_local=False):
+                        client_local=False, desktop_local=False, restore_existing=True):
     """Everything before the creation commit: the existing session's ref on an exact retry, else the
     receipt ``commit_local_session`` writes (the async RPC commits it off the owner loop).
     ``client_local``: the gateway's own proof that the client is on this host (its connection redeemed a
@@ -314,7 +314,10 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             key = launch_key(authority, original)
             if key is None or not hmac.compare_digest(key, params.get('api_key') or ''):
                 raise RuntimeStoreError('admission_conflict')
-        return restore_local_session(authority, sid)
+        if restore_existing:
+            return restore_local_session(authority, sid)
+        from gateway.session_authority import SessionRef
+        return SessionRef(authority.profile_id, sid)
     from gateway.session_policy import launch_skills
     if launch_skills(params) and skills_prompt is None:
         # `-s` is rendered off-loop by the RPC handler (render_launch_skills); a caller that

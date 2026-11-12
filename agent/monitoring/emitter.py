@@ -22,11 +22,16 @@ _DRAIN_BATCH = 256
 
 
 class MonitoringEmitter:
-    """Owns the queue, the dispatcher thread, and the subscriber list."""
+    """Process-lifetime bus; last detach disables admission, not the shared worker.
+
+    Each subscription has a fresh generation. Queued/captured older work cannot
+    reach a replacement subscriber, even across an interval with zero consumers.
+    ``close`` is final disposal (tests/CLI), never a plane's detach operation.
+    """
 
     def __init__(self, *, enabled: bool = True) -> None:
         self._enabled = enabled
-        self._q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=_MAX_QUEUE)
+        self._q: queue.Queue[tuple[int, dict[str, Any]]] = queue.Queue(maxsize=_MAX_QUEUE)
         self._dropped = 0
         self._dispatched = 0
         self._stop = threading.Event()
@@ -34,7 +39,8 @@ class MonitoringEmitter:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         # Subscribers are callable(batch: list[dict]), invoked on the dispatcher thread.
-        self._subscribers: list = []
+        self._subscribers: dict[Any, int] = {}
+        self._generation = 0
 
     # ── public API (hot path) ───────────────────────────────────────────────
     def emit(self, event: Any) -> None:
@@ -45,19 +51,27 @@ class MonitoringEmitter:
             payload = event.to_dict() if hasattr(event, "to_dict") else dict(event)
             payload.setdefault("ts_ns", time.time_ns())
             self._ensure_started()
-            try:
-                self._q.put_nowait(payload)
-            except queue.Full:
-                # Drop oldest to make room — bounded memory, newest-wins.
-                try:
-                    self._q.get_nowait()
-                    self._q.task_done()
-                    self._dropped += 1
-                    self._q.put_nowait(payload)
-                except Exception:
-                    self._dropped += 1
+            # Admission and subscription changes share only this short bookkeeping lock.
+            with self._lock:
+                if not self._enabled or self._stop.is_set():
+                    return
+                self._enqueue((self._generation, payload))
         except Exception:  # the hot-path invariant: never propagate
             logger.debug("monitoring emit failed", exc_info=True)
+
+    def _enqueue(self, item) -> None:
+        try:
+            self._q.put_nowait(item)
+        except queue.Full:
+            # Drop oldest to make room — bounded memory, newest-wins.
+            try:
+                self._q.get_nowait()
+                self._q.task_done()
+                self._dropped += 1
+                self._q.put_nowait(item)
+            except Exception:
+                logger.debug("monitoring queue replacement failed", exc_info=True)
+                self._dropped += 1
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def _ensure_started(self) -> None:
@@ -89,28 +103,44 @@ class MonitoringEmitter:
                     self._q.task_done()
 
     def _dispatch(self, batch) -> None:
-        for sub in list(self._subscribers):
+        with self._lock:
+            subscribers = list(self._subscribers.items())
+        for sub, generation in subscribers:
+            # A captured old callback and queued pre-subscription events cannot enter
+            # a replacement plane, even when health keeps the process bus alive.
+            if self._subscribers.get(sub) != generation:
+                continue
+            accepted = [event for admitted, event in batch if admitted >= generation]
+            if not accepted:
+                continue
             try:
-                sub(batch)
+                sub(accepted)
             except Exception:
                 logger.debug("monitoring subscriber failed", exc_info=True)
         self._dispatched += len(batch)
 
     def subscribe(self, callback) -> None:
         """Register a live batch subscriber; the first subscriber enables collection."""
-        if callback not in self._subscribers:
-            self._subscribers.append(callback)
-        self._enabled = True
+        with self._lock:
+            if self._stop.is_set():
+                raise RuntimeError("monitoring emitter is closed")
+            if callback not in self._subscribers:
+                self._generation += 1
+                self._subscribers[callback] = self._generation
+            self._enabled = True
 
     def unsubscribe(self, callback) -> None:
-        with suppress(ValueError):
-            self._subscribers.remove(callback)
-        if not self._subscribers:
-            self._enabled = False
+        with self._lock:
+            self._subscribers.pop(callback, None)
+            if not self._subscribers:
+                self._enabled = False
 
     # ── introspection / shutdown (tests, CLI) ───────────────────────────────
-    def flush(self, timeout: float = 2.0) -> None:
-        """Wait boundedly for queued and in-flight batches to finish dispatch."""
+    def flush(self, timeout: Optional[float] = 2.0) -> None:
+        """Wait for queued/in-flight dispatch; None is for off-loop retirement only."""
+        if timeout is None:
+            self._q.join()  # off-loop lifecycle worker; never the async owner
+            return
         if timeout <= 0:
             return
         finished = threading.Event()

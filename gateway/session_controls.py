@@ -419,6 +419,20 @@ class AuthorityConnection:
         return await readiness(self.authority, self.actor, params, runtime=True)
 
     async def create(self, ref, params):
+        # ponytail: serialize creations per authority through commit; use keyed
+        # request locks only if concurrent chat creation becomes a bottleneck.
+        lock = getattr(self.authority, '_local_create_lock', None)
+        if lock is None:
+            lock = self.authority._local_create_lock = asyncio.Lock()
+        async def staged_create():
+            async with lock:
+                return await self._create_serial(ref, params)
+        from gateway.session_runtime_workers import track_mutation
+        # Client cancellation must not release the binding lock while its
+        # physical staging thread is still discovering/committing this create.
+        return await asyncio.shield(track_mutation(self.authority, staged_create()))
+
+    async def _create_serial(self, ref, params):
         from gateway.session_local_title import validate_title
         title = validate_title(params.pop('title')) if 'title' in params else None
         if title is None:
@@ -463,9 +477,15 @@ class AuthorityConnection:
                 if self.authority.db.get_session(sid) is None:
                     skills_prompt = await asyncio.to_thread(render_launch_skills, params, sid)
             # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
-            ref = stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
-                                      client_local=self.native_owner,
-                                      desktop_local=getattr(self.transport, 'desktop_local', False))
+            # Staging eagerly discovers editor MCP servers. ACP-tunneled peers
+            # answer on this event loop, so blocking here deadlocks discovery.
+            ref = await asyncio.to_thread(stage_local_session, self.authority, self.actor, params,
+                                          skills_prompt=skills_prompt, client_local=self.native_owner,
+                                          desktop_local=getattr(self.transport, 'desktop_local', False),
+                                          restore_existing=False)
+            if not isinstance(ref, dict):
+                # Existing-session restoration is owner-loop work (event streams).
+                ref = restore_local_session(self.authority, ref.session_id)
             if isinstance(ref, dict):
                 # The creation commit runs off the owner loop: a held writer must not freeze
                 # every session behind one new chat (N50).
@@ -614,6 +634,13 @@ class AuthorityConnection:
             # whose earlier open found it busy (Desktop's warm `session.activate` resumes on one connection).
             from gateway.session_policy_refresh import refresh_resumed_policy
             await refresh_resumed_policy(self.authority, ref, attached=ref.session_id in self.subscriptions)
+        # The durable gateway-handoff notice commits BEFORE the snapshot: it is an ordinary
+        # transcript row (deterministic uid, one per logical session per owner epoch), so
+        # attach's existing history carries it, duplicate resumes collapse on the id, and
+        # session_meta's existing model-history exclusion keeps it out of the LLM context.
+        from gateway.session_handoff import ensure_session_handoff
+        handoff_notice = await asyncio.to_thread(
+            ensure_session_handoff, self.authority, ref.session_id)
         snapshot = await self.authority.attach(self.actor, ref)
         self.subscriptions[ref.session_id] = snapshot.subscription_id
         self._spawn_notice(ref)
@@ -637,6 +664,7 @@ class AuthorityConnection:
                 'messages': history, **display, 'message_count': len(history),
                 'running': snapshot.handle.execution_state == 'running',
                 'authority_epoch': snapshot.handle.authority_epoch,
+                'handoff': handoff_notice,
                 'replay_epoch': snapshot.replay_epoch, 'last_sequence': snapshot.last_sequence,
                 'subscription_id': snapshot.subscription_id, 'revision': snapshot.handle.revision,
                 'execution_generation': snapshot.handle.execution_generation,

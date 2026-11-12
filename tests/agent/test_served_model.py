@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import openai
+import pytest
 
 from agent.served_model import install_served_model_capture, result_model_fields
 
@@ -14,15 +15,20 @@ class _Agent:
     _primary_runtime: dict = {}
 
 
-def test_httpx_hook_captures_litellm_header_and_clears_when_absent():
-    served = {"value": "gpt-4o-2024-11-20"}
+@pytest.mark.parametrize("headers,display", [
+    ({"x-litellm-model-id": "gpt-4o-2024-11-20", "x-litellm-model-api-base": "opaque-endpoint"},
+     "gpt-4o-2024-11-20"),
+    ({"x-litellm-model-api-base": "https://proxy.test/v1"}, "https://proxy.test/v1"),
+    ({"x-litellm-model-api-base": "opaque-endpoint"}, "opaque-endpoint"),
+])
+def test_httpx_hook_captures_litellm_header_and_clears_when_absent(headers, display):
+    served = {"headers": headers}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        headers = {"x-litellm-model-id": served["value"]} if served["value"] else {}
         return httpx.Response(200, json={
             "id": "c", "object": "chat.completion", "created": 0, "model": "hermes-router",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-        }, headers=headers)
+        }, headers=served["headers"])
 
     client = openai.OpenAI(api_key="x", base_url="http://proxy.test/v1",
                            http_client=httpx.Client(transport=httpx.MockTransport(handler)), max_retries=0)
@@ -32,9 +38,17 @@ def test_httpx_hook_captures_litellm_header_and_clears_when_absent():
     assert len(client._client.event_hooks["response"]) == 1
 
     client.chat.completions.create(model="hermes-router", messages=[{"role": "user", "content": "hi"}])
-    assert result_model_fields(agent) == {"requested_model": "hermes-router", "served_model": "gpt-4o-2024-11-20"}
+    assert result_model_fields(agent) == {"requested_model": "hermes-router", "served_model": display}
 
-    served["value"] = ""  # next response has no routing header: the stale value must not survive
+    # A route change without another captured response retains the existing UI label.
+    agent._fallback_activated = True
+    agent._primary_runtime = {"model": "hermes-router"}
+    agent.model = "active-fallback"
+    assert result_model_fields(agent) == {"requested_model": "active-fallback", "served_model": display}
+    agent._fallback_activated = False
+    agent.model = "hermes-router"
+
+    served["headers"] = {}  # next response has no routing header: the stale value must not survive
     client.chat.completions.create(model="hermes-router", messages=[{"role": "user", "content": "hi"}])
     assert result_model_fields(agent) == {"requested_model": "hermes-router", "served_model": None}
 

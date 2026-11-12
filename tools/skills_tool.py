@@ -169,18 +169,15 @@ def check_skills_requirements() -> bool:
     return True  # always available: the directory is created on first use
 
 
-def _get_category_from_path(skill_path: Path) -> Optional[str]:
-    """``~/.hermes/skills/mlops/axolotl/SKILL.md`` -> ``"mlops"``; active profile dir first
-    (respects test monkeypatching), then skills.external_dirs."""
-    dirs_to_check = [_skills_dir()]
-    with suppress(Exception):
-        from agent.skill_utils import get_external_skills_dirs
-        dirs_to_check.extend(get_external_skills_dirs())
-    for skills_dir in dirs_to_check:
+def _get_category_from_path(skill_path: Path, scan_root: Path | None = None) -> Optional[str]:
+    """Nested category relative to the resolved scan root; uncategorized skills stay None."""
+    roots = [scan_root] if scan_root is not None else [d for _, d in skill_search_dirs()[0]]
+    for root in roots:
         with suppress(ValueError):
-            if len(parts := skill_path.relative_to(skills_dir).parts) >= 3:
-                return parts[0]
+            parts = skill_path.relative_to(root).parts
+            return "/".join(parts[:-2]) or None
     return None
+
 
 
 def _parse_tags(tags_value) -> list[str]:
@@ -258,7 +255,7 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
                 scanned.append({
                     "name": frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH],
                     "description": _truncate_description(description),
-                    "category": _get_category_from_path(skill_md), "tier": tier, "root": scan_dir,
+                    "category": _get_category_from_path(skill_md, scan_dir), "tier": tier, "root": scan_dir,
                     "path": skill_md, "visible": bool(skill_matches_platform(frontmatter)
                                                       and skill_matches_environment(frontmatter)
                                                       and skill_matches_apps(frontmatter))})
@@ -287,29 +284,49 @@ def sort_skills(skills: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str | None = None, task_id: str | None = None) -> str:
+def skills_list(category: str | None = None, task_id: str | None = None,
+                query: str | None = None, limit: int = 20) -> str:
     """Tier 1 listing: name + description (+ category) only; ``task_id`` is handler parity."""
     try:
+        if query is not None and isinstance(query, str) and not query.strip():
+            query = None  # Models auto-fill optional params with "": treat blank as unfiltered.
+        if query is not None:
+            if not isinstance(query, str) or len(query) > 200:
+                return tool_error("query must be 1–200 nonblank characters when provided", success=False)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+                return tool_error("limit must be an integer from 1 to 100", success=False)
         _skills_dir().mkdir(parents=True, exist_ok=True)
         all_skills = find_all_skills()
         try:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
             discover_plugins()
             for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
+                plugin_skill = dict(plugin_skill)
                 frontmatter = plugin_skill.pop("frontmatter", {})
-                if not skill_matches_platform(frontmatter) or _is_skill_disabled(plugin_skill["name"]):
+                if not (skill_matches_platform(frontmatter) and skill_matches_environment(frontmatter)
+                        and skill_matches_apps(frontmatter)) or _is_skill_disabled(plugin_skill["name"]):
                     continue
                 all_skills.append(plugin_skill)
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
+            return tool_error("Installed-skill discovery failed while listing plugins; results are incomplete. Retry before concluding no skill applies.", success=False)
         if not all_skills:
             return _json({"success": True, "skills": [], "categories": [],
+                          **({"count": 0, "total_matches": 0, "has_more": False, "query": query} if query is not None else {}),
                           "message": "No skills found in skills/ directory."})
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
         all_skills = sort_skills(all_skills)
+        if query is not None:
+            words = query.casefold().split()
+            all_skills = [s for s in all_skills if all(
+                word in " ".join(str(s.get(k, "")) for k in ("name", "description", "category")).casefold()
+                for word in words)]
+            total = len(all_skills)
+            all_skills = all_skills[:limit]
         categories = sorted({s.get("category") for s in all_skills if s.get("category")})
         return _json({
+            **({"total_matches": total, "has_more": total > len(all_skills), "query": query} if query is not None else {}),
             "success": True, "skills": all_skills, "categories": categories,
             "count": len(all_skills),
             "hint": "Use skill_view(name) to see full content, tags, and linked files"})
@@ -696,14 +713,16 @@ def skill_view(
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": "List or search installed skills by name, description and category. Use query for task keywords; skill_view(name) loads guidance. Not a hub search.",
     "parameters": {
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {"type": "string", "description": "Installed-skill keywords; all words must match metadata (1–200 characters)."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum search matches; default 20. Unqueried listing is unchanged."},
         },
         "required": [],
     },
@@ -730,7 +749,8 @@ SKILL_VIEW_SCHEMA = {
 
 registry.register(
     name="skills_list", toolset="skills", schema=SKILLS_LIST_SCHEMA,
-    handler=lambda args, **kw: skills_list(category=args.get("category"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: skills_list(category=args.get("category"), task_id=kw.get("task_id"),
+                                          query=args.get("query"), limit=args.get("limit", 20)),
     check_fn=check_skills_requirements, emoji="📚")
 
 

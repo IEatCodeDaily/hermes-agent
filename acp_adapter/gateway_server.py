@@ -17,9 +17,62 @@ from acp.schema import (
 from hermes_cli.gateway_client import GatewayClientError, connect_gateway
 from hermes_constants import get_hermes_home
 from acp_adapter.gateway_reply import GatewayReplyMixin, _text
+from acp_adapter.gateway_errors import gateway_errors, request_error
 from acp_adapter.session import _translate_acp_cwd, _normalize_cwd_for_compare
 
 logger = logging.getLogger(__name__)
+
+# ``message.start`` cards that name an async wake: their turn is the report of background work an
+# earlier turn started, so the roster holds that work's exit until this turn settles.
+_WAKE_DISPLAY_KINDS = {"process_complete", "async_delegation_complete"}
+
+
+def _client_wants_state_update(params):
+    """The editor's opt-in for ``_hermes-agent/state_update``: ``stateUpdate >= 1`` under
+    ``clientCapabilities._meta["hermes-agent"]`` or the ``bb.dev`` alias (the same unstable
+    capability convention ``initialize``'s typed model drops)."""
+    meta = ((params or {}).get("clientCapabilities") or {}).get("_meta") or {}
+    for namespace in ("hermes-agent", "bb.dev"):
+        wants = meta.get(namespace)
+        if isinstance(wants, dict) and isinstance(wants.get("stateUpdate"), int) \
+                and wants["stateUpdate"] >= 1:
+            return True
+    return False
+
+
+async def _rename_t3_thread(title):
+    """Mirror a session title onto the calling T3 Code thread; no-op outside T3. T3 drops ACP
+    ``session_info_update`` titles, but gives each ACP agent a thread-bound MCP credential
+    (``T3_ACP_MCP_*``) and a CLI caller for it (``T3_ACP_MCP_NODE acp-mcp-call``)."""
+    node = os.environ.get("T3_ACP_MCP_NODE")
+    # A title naming T3's own instruction wrapper says nothing about the work; never mirror it.
+    if "t3_code_instructions" in title or title.lower().startswith("t3 code interaction"):
+        return
+    if not (node and os.environ.get("T3_ACP_MCP_ENDPOINT") and os.environ.get("T3_ACP_MCP_AUTHORIZATION")):
+        return
+    import json
+    entry = os.environ.get("T3_ACP_MCP_ENTRYPOINT")
+    argv = [node, *([entry] if entry else []), "acp-mcp-call", "t3_thread_update",
+            json.dumps({"action": "rename", "title": title})]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, env={**os.environ, "ELECTRON_RUN_AS_NODE": "1"},
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), 30)
+        if proc.returncode:
+            logger.debug("T3 thread rename failed: %s", err[-300:])
+    except Exception:
+        logger.debug("T3 thread rename failed", exc_info=True)
+
+
+_rename_tasks = set()
+
+
+def _spawn_rename(title):
+    """Fire-and-forget ``_rename_t3_thread``; the set keeps the task alive until it finishes."""
+    task = asyncio.get_running_loop().create_task(_rename_t3_thread(title))
+    _rename_tasks.add(task)
+    task.add_done_callback(_rename_tasks.discard)
 
 
 def _slash_command(text):
@@ -43,15 +96,16 @@ def _slash_command(text):
     return name if name in ROUTES else None
 
 
-def _bypass_route():
+def _bypass_route(environ=None):
     """--safe-mode / --ignore-user-config read no profile default route, so the session freezes the
     launch's explicit one (``hermes -m <model> --provider <name> --safe-mode acp``). Both, refused at
     session/new: a model alone is accepted by the owner, then its first turn cannot build the agent."""
-    model = (os.environ.get("HERMES_MODEL") or os.environ.get("HERMES_INFERENCE_MODEL") or "").strip()
+    environ = os.environ if environ is None else environ
+    model = (environ.get("HERMES_MODEL") or environ.get("HERMES_INFERENCE_MODEL") or "").strip()
     if not model:
         raise GatewayClientError("--safe-mode / --ignore-user-config read no profile default model: launch "
                                  "with one, e.g. hermes -m <model> --provider <provider> --safe-mode acp")
-    provider = os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip()
+    provider = environ.get("HERMES_INFERENCE_PROVIDER", "").strip()
     if not provider:
         raise GatewayClientError("--safe-mode / --ignore-user-config read no profile provider: launch with "
                                  "--provider too, e.g. hermes -m <model> --provider <provider> --safe-mode acp")
@@ -65,7 +119,10 @@ def _tools_changed_notice(payload):
 
 
 class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
-    def __init__(self):
+    def __init__(self, *, environ=None, connector=None, mcp_tunnel=False):
+        self._environ = os.environ if environ is None else environ
+        self._connector = connector
+        self._hosted_mcp = mcp_tunnel
         self._conn = None
         self._gateway = None
         self._connection = None
@@ -111,6 +168,15 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # Editor-held compression-tip id -> logical session id (see ``_resume``).
         self._aliases = {}
         self._form_elicitation = False
+        # ``initialize`` opted this editor into ``_hermes-agent/state_update`` (run boundaries +
+        # background roster); sessions whose async wake turn is running; exited processes held
+        # past their finish until that wake settles (ACP v2's known-follow-up rule).
+        self._state_update = False
+        self._wake_inflight = set()
+        self._exited_seen = {}
+        # Sessions' finalized exits (their wake settled): reported once more if the owner's
+        # finished registry still lists them, then never again; bounded, insertion-ordered.
+        self._finalized = {}
         from hermes_cli.gateway_mutations import PreparedMutations
         self._mutations = PreparedMutations()
         # Session -> title the editor was last shown (``session_info_update`` fires on a change).
@@ -120,9 +186,16 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # Session -> the owner's latest usage dict (``session.usage`` / ``session.stats``).
         self._usage = {}
         self._background = set()
+        self._mcp_projection = None
 
     def on_connect(self, conn):
         self._conn = conn
+        # Only hosted projections share the gateway process and can hand it an
+        # in-memory transport. Legacy stdio keeps its existing MCP offerings.
+        if self._hosted_mcp:
+            from acp_adapter.mcp_tunnel import ProjectionMCP, install_routes
+            self._mcp_projection = ProjectionMCP(conn)
+            install_routes(conn, self)
         add_observer = getattr(getattr(conn, "_conn", None), "add_observer", None)
         if callable(add_observer):
             add_observer(self._observe_client_message)
@@ -134,18 +207,31 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 and message.get("method") == "initialize":
             from acp_adapter.elicitation import client_supports_form_elicitation
             self._form_elicitation = client_supports_form_elicitation(message.get("params"))
+            self._state_update = _client_wants_state_update(message.get("params"))
 
+    @gateway_errors
     async def initialize(self, **kwargs):
         from hermes_cli import __version__
         from acp_adapter.auth import build_auth_methods
-        return InitializeResponse(protocol_version=acp.PROTOCOL_VERSION,
+        response = InitializeResponse(protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=__version__),
             agent_capabilities=AgentCapabilities(load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(fork=SessionForkCapabilities(), list=SessionListCapabilities(),
                                                          resume=SessionResumeCapabilities())),
-            auth_methods=build_auth_methods())
+            auth_methods=await asyncio.to_thread(build_auth_methods))
+        if self._mcp_projection is not None:
+            # The SDK capability model otherwise silently drops this unstable field.
+            response = response.model_dump(by_alias=True, exclude_none=True)
+            response["agentCapabilities"]["mcpCapabilities"] = {"acp": True}
+        return response
 
+    def _mcp_specs(self, servers):
+        if self._mcp_projection is not None:
+            return self._mcp_projection.bind(servers or [])
+        return [s.model_dump(by_alias=True) for s in servers or []]
+
+    @gateway_errors
     async def authenticate(self, method_id, **kwargs):
         from acp_adapter.server import HermesACPAgent
         return await HermesACPAgent.authenticate(self, method_id, **kwargs)
@@ -158,7 +244,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 # connection instead of the stale error forever.
                 await self._teardown()
             if self._gateway is None:
-                connection = connect_gateway()
+                connection = (self._connector or connect_gateway)()
                 gateway = await connection.__aenter__()
                 try:
                     descriptor = await gateway.rpc("runtime.describe")
@@ -212,6 +298,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 self._adopted[session_id] = resumes
             self._changed.notify_all()
         await self._project_mode(session_id, self._editor_id(session_id), snapshot.get("info") or {})
+        # A fresh adopt is a state boundary for opted-in editors: running if the snapshot shows a
+        # started turn (ours or a queued admission's), idle otherwise, with the live roster.
+        started = next((row for row in snapshot.get("pending", []) if row.get("status") == "started"), None)
+        await self._send_state_update(session_id, self._editor_id(session_id),
+            "running" if started else "idle",
+            run_id=started.get("admission_id") if started else None, gateway=self._gateway)
 
     async def _request_live_reasoning(self, client, session_id):
         """Ask the owner to stream this session's reasoning (``show_reasoning``), as the CLI does.
@@ -268,6 +360,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             self._failure = None
             self._changed.notify_all()
 
+    @gateway_errors
     async def new_session(self, cwd, mcp_servers=None, **kwargs):
         client = await self._client()
         descriptor = await client.rpc("runtime.describe")
@@ -277,18 +370,18 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         from hermes_cli.gateway_chat import env_launch_flags
         # `hermes acp --yolo` / `--safe-mode` / ... reach this process as their env equivalents; the
         # owner does not inherit them, so they freeze into this session's policy or not at all.
-        flags = env_launch_flags()
+        flags = env_launch_flags(self._environ)
         if flags.get("safe_mode") or flags.get("ignore_user_config"):
-            flags.update(_bypass_route())
+            flags.update(_bypass_route(self._environ))
         snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
             source="acp", cwd=_translate_acp_cwd(cwd),
-            editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
+            editor={"mcp_servers": self._mcp_specs(mcp_servers),
                     "edit_approval_policy": "ask"}, **flags)
         session_id = snapshot["session_id"]
         await self._adopt(session_id, snapshot)
         if mcp_servers:
             self._editor_mcp[session_id] = {
-                "mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers]}
+                "mcp_servers": self._mcp_specs(mcp_servers)}
         info = snapshot.get("info") or await client.rpc("session.info", session_id=session_id)
         await self._request_live_reasoning(client, session_id)
         return NewSessionResponse(session_id=session_id, **await self._session_fields(session_id, info, session_id))
@@ -313,7 +406,26 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # ``_adopt`` seeded the mode from the snapshot: a change the pump projected since is what the reply shows.
         modes = session_modes({"edit_approval_policy": MODE_TO_EDIT_APPROVAL_POLICY[self._modes.setdefault(
             session_id, session_modes(info).current_mode_id)]})
-        return {"models": models, "modes": modes, "field_meta": meta}
+        return {"models": models, "modes": modes, "field_meta": meta,
+                "config_options": await self._reasoning_options(session_id)}
+
+
+    async def _reasoning_options(self, session_id):
+        """Expose the owner's existing per-session reasoning setting through ACP."""
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+        current = await (await self._client()).rpc("config.get", session_id=session_id, key="reasoning")
+        return [SessionConfigOptionSelect(
+            id="reasoning", name="Thinking level", category="thought_level", type="select",
+            current_value=current["value"],
+            options=[SessionConfigSelectOption(value=v, name=v.title())
+                     for v in ("none", "minimal", "low", "medium", "high", "xhigh")])]
+
+    async def _set_reasoning_option(self, session_id, value):
+        if value not in ("none", "minimal", "low", "medium", "high", "xhigh"):
+            raise GatewayClientError("invalid_params")
+        await (await self._client()).rpc("config.set", session_id=session_id,
+                                        key="reasoning", value=value, scope="session")
+        return await self._reasoning_options(session_id)
 
     async def _after_attach(self, session_id, editor_id):
         from acp_adapter.gateway_session_meta import available_commands_update
@@ -339,7 +451,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await client.rpc("session.detach", session_id=session_id, subscription_id=adopted["subscription_id"])
         return await client.rpc("session.info", session_id=session_id)
 
-    async def _resume(self, cwd, held_id, mcp_servers):
+    async def _resume(self, cwd, held_id, mcp_servers, *, replay=True):
         client = await self._client()
         from acp_adapter.catalog import logical_session_id
         from hermes_cli.gateway_client import GatewayRPCError
@@ -362,7 +474,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             descriptor = await client.rpc("runtime.describe")
             if "acp-session-mcp-v1" not in descriptor.get("capabilities", []):
                 raise GatewayClientError("acp_mcp_policy_unavailable")
-            resume_params['editor'] = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]}
+            resume_params['editor'] = {'mcp_servers': self._mcp_specs(mcp_servers)}
         try:
             snapshot = await client.rpc("session.resume", session_id=session_id, **resume_params)
         except GatewayRPCError as exc:
@@ -376,7 +488,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if 'editor' in resume_params:
             self._editor_mcp[session_id] = resume_params['editor']
         from acp_adapter.server import _history_replay_updates
-        if self._conn:
+        if self._conn and replay:
             # The editor replays the live transcript in stored order, as main's ACP did; archived rows
             # (summarized away by a compression) are display-only.
             live = sorted((m for m in snapshot["messages"] if not m.get("archived")), key=lambda m: m.get("row_id") or 0)
@@ -407,11 +519,15 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await self._mutations.apply(client, session_id, 'editor_mcp', editor)
         self._mutations.acknowledge(session_id, 'editor_mcp', editor)
 
+    @gateway_errors
     async def load_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         return LoadSessionResponse(**await self._resume(cwd, session_id, mcp_servers))
 
+    @gateway_errors
     async def resume_session(self, cwd, session_id, mcp_servers=None, **kwargs):
-        return ResumeSessionResponse(**await self._resume(cwd, session_id, mcp_servers))
+        from acp_adapter.relay import REATTACH_META
+        return ResumeSessionResponse(**await self._resume(
+            cwd, session_id, mcp_servers, replay=not kwargs.get(REATTACH_META, False)))
 
     async def _cancel_admission(self, session_id, admission_id):
         client = await self._client()
@@ -439,6 +555,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 if settled["status"] != "terminal":
                     raise
 
+    @gateway_errors
     async def cancel(self, session_id, **kwargs):
         session_id = self._aliases.get(session_id, session_id)
         if session_id not in self._snapshots:
@@ -450,6 +567,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return
         await self._cancel_admission(session_id, admission_id)
 
+    @gateway_errors
     async def fork_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         from acp.schema import ForkSessionResponse
         session_id = self._aliases.get(session_id, session_id)
@@ -457,7 +575,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         info = await client.rpc('session.info', session_id=session_id)
         # The owner binds the child's editor servers under the child's own scope: these, or else a
         # copy of the parent's.
-        payload = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]} if mcp_servers else {}
+        payload = {'mcp_servers': self._mcp_specs(mcp_servers)} if mcp_servers else {}
         self._unacked.pop(session_id, None)
         result = await self._mutations.apply(client, session_id, 'branch', payload)
         child = result['branched_session_id']
@@ -471,6 +589,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await self._request_live_reasoning(client, child)
         return ForkSessionResponse(session_id=child, **await self._session_fields(child, info, child))
 
+    @gateway_errors
     async def set_session_model(self, model_id, session_id, **kwargs):
         from acp.schema import SetSessionModelResponse
         session_id = self._aliases.get(session_id, session_id)
@@ -564,6 +683,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             raise GatewayClientError("not_found")
         return session_id
 
+    @gateway_errors
     async def set_session_mode(self, mode_id, session_id, **kwargs):
         """Main's Default / Accept Edits / Don't Ask: the session's edit approval policy on the owner."""
         from acp.schema import SetSessionModeResponse
@@ -573,12 +693,15 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await self._set_edit_policy(self._held_session(session_id), MODE_TO_EDIT_APPROVAL_POLICY[mode_id])
         return SetSessionModeResponse()
 
+    @gateway_errors
     async def set_config_option(self, config_id, session_id, value=None, **kwargs):
         """Accepted so editors do not fail on their own config writes, as main did; only the edit
         approval policy has a meaning here, and it is the same owner setting the modes select."""
         from acp.schema import SetSessionConfigOptionResponse
         from acp_adapter.modes import EDIT_APPROVAL_POLICY_CONFIG_ID, EDIT_APPROVAL_POLICY_TO_MODE
         session_id = self._held_session(session_id)
+        if config_id == "reasoning":
+            return SetSessionConfigOptionResponse(config_options=await self._set_reasoning_option(session_id, value))
         if config_id == EDIT_APPROVAL_POLICY_CONFIG_ID:
             if value not in EDIT_APPROVAL_POLICY_TO_MODE:
                 raise GatewayClientError("invalid_params")
@@ -603,12 +726,14 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     if str(exc) == "session_busy" else "Mode changes wait for the lost turn: "
                     + self._unknown_recovery(session_id, submitted=False).removeprefix("unknown_execution: "))
             if self._conn:
-                await self._conn.session_update(session_id=self._editor_id(session_id),
-                                                update=acp.update_agent_message_text(text + "\n"))
-            raise acp.RequestError(-32603, text) from exc
+                with suppress(Exception):
+                    await self._conn.session_update(session_id=self._editor_id(session_id),
+                                                    update=acp.update_agent_message_text(text + "\n"))
+            raise request_error(exc, session_id, recovery=text) from exc
         self._mutations.acknowledge(session_id, "edit_policy", payload)
         self._modes[session_id] = EDIT_APPROVAL_POLICY_TO_MODE[policy]
 
+    @gateway_errors
     async def list_sessions(self, cursor=None, cwd=None, **kwargs):
         from acp.schema import ListSessionsResponse, SessionInfo
         from acp_adapter.catalog import catalog_sessions
@@ -620,6 +745,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                             updated_at=row.get("updated_at")) for row in rows[:50]]
         return ListSessionsResponse(sessions=page, next_cursor=page[-1].session_id if len(rows) > 50 else None)
 
+    @gateway_errors
     async def prompt(self, prompt, session_id, **kwargs):
         held_id, session_id = session_id, self._aliases.get(session_id, session_id)
         if session_id not in self._snapshots:
@@ -937,6 +1063,64 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 self._failure = exc
                 self._changed.notify_all()
 
+    def _background_item(self, row):
+        """One owner process row in ACP v2 ``state_update.background`` item shape."""
+        item = {"type": "terminal", "id": row["session_id"], "status": "running"}
+        if row.get("status") == "exited":
+            code = row.get("exit_code")
+            item["status"] = "completed" if code == 0 else "failed"
+            if code is not None:
+                item["exitCode"] = code
+        return item
+
+    async def _background_roster(self, sid, gateway=None):
+        """The session's background roster, recomputed from ``process.list`` ground truth; exited
+        processes stay listed (``known follow-up``: reported finished, removed only once the wake
+        that delivers their result settles). ``None`` when no owner connection can read it — the
+        caller then omits the key (unreported), never an empty list (quiet)."""
+        gateway = gateway or self._gateway
+        if gateway is None:
+            return None
+        try:
+            rows = (await gateway.rpc("process.list", session_id=sid)).get("processes") or []
+        except Exception:
+            # Boundary: a roster read must not fail the boundary notification; fall back to the
+            # last known rows (a stale roster for one beat beats lying "quiet").
+            logger.debug("state_update roster read failed for %s", sid, exc_info=True)
+            rows = []
+        finalized = self._finalized.setdefault(sid, {})
+        for row in rows:
+            if row.get("status") == "exited":
+                if row["session_id"] not in finalized:
+                    self._exited_seen.setdefault(sid, {})[row["session_id"]] = row
+            else:
+                finalized.pop(row["session_id"], None)  # a respawned id is new work
+        merged = {row["session_id"]: row for row in rows if row["session_id"] not in finalized}
+        merged.update({pid: row for pid, row in (self._exited_seen.get(sid) or {}).items()
+                       if pid not in merged})
+        return [self._background_item(row) for row in merged.values()]
+
+    async def _send_state_update(self, sid, editor_id, state, stop_reason=None, run_id=None,
+            gateway=None):
+        """One ``_hermes-agent/state_update`` notification (opt-in extension): the session's run
+        boundary plus its background roster, for editors that declared
+        ``clientCapabilities._meta["hermes-agent"|"bb.dev"].stateUpdate``."""
+        if not (self._state_update and self._conn):
+            return
+        update = {"sessionId": editor_id, "state": state}
+        if stop_reason is not None:
+            update["stopReason"] = stop_reason
+        if run_id is not None:
+            update["_meta"] = {"runId": run_id}
+        roster = await self._background_roster(sid, gateway)
+        if roster is not None:
+            update["background"] = roster
+        try:
+            await self._conn.ext_notification("hermes-agent/state_update", update)
+        except Exception:
+            # Boundary: an editor that hung up mid-notification must not fail the projection.
+            logger.debug("state_update notification failed for %s", sid, exc_info=True)
+
     async def _project(self, event):
         kind, payload = event.get("type"), event.get("payload", {})
         sid, editor_id = event["session_id"], self._editor_id(event["session_id"])
@@ -960,6 +1144,14 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if kind in {"tool.start", "tool.complete"}:
             await self._project_tool(kind, sid, editor_id, aid, payload)
             return
+        if kind == "message.start":
+            # Run boundaries for editors that opted into ``_hermes-agent/state_update``. The
+            # claim's card (``admission_display``) names the async wakes: their exited work is
+            # held in the roster until this turn settles.
+            if payload.get("display_kind") in _WAKE_DISPLAY_KINDS:
+                self._wake_inflight.add(sid)
+            await self._send_state_update(sid, editor_id, "running", run_id=aid)
+            return
         if kind == "message.delta":
             text = _text(payload)
             self._streamed[aid] = self._streamed.get(aid, "") + text
@@ -977,6 +1169,16 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     await self._conn.session_update(session_id=editor_id, update=self._chunk(sid, text + "\n\n"))
                 self._end_message(sid)
         elif kind == "message.complete":
+            if sid in self._wake_inflight:
+                # The wake turn settled: the exits it reported are finalized — they leave the
+                # roster for good, even while the owner's finished registry still lists them.
+                self._wake_inflight.discard(sid)
+                finalized = self._finalized.setdefault(sid, {})
+                finalized.update(dict.fromkeys(self._exited_seen.pop(sid, {})))
+                while len(finalized) > 32:  # ponytail: fixed cap; a per-process ack if it grows
+                    finalized.pop(next(iter(finalized)))
+            await self._send_state_update(sid, editor_id, "idle",
+                stop_reason="cancelled" if payload.get("outcome") == "cancelled" else "end_turn")
             if aid in self._settling or aid in self._receipted:
                 # A retry's terminal receipt claimed this reply; it is shown once, from there.
                 self._streamed.pop(aid, None)
@@ -1079,6 +1281,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if self._conn:
             from acp_adapter.gateway_session_meta import title_update
             await self._conn.session_update(session_id=editor_id, update=title_update(title))
+        _spawn_rename(title)
 
     def _permission(self, session_id, prompt):
         answer = {"approval": self._answer_permission, "clarify": self._answer_clarify}.get(prompt.get("kind"))
@@ -1165,6 +1368,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return False
 
     async def aclose(self):
+        if self._mcp_projection is not None:
+            await self._mcp_projection.aclose()
         # Post-attach notices first: one paused mid-notice would otherwise resume after the
         # teardown and open a fresh gateway connection through ``_client``.
         background = list(self._background)

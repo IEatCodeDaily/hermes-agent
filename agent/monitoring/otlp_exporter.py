@@ -14,6 +14,7 @@ import importlib
 import logging
 import os
 import re
+import threading
 from contextlib import suppress
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -30,7 +31,7 @@ class OTLPUnavailable(RuntimeError):
 # ── SDK loading ──────────────────────────────────────────────────────────────
 _SDK_MODULES: dict[str, tuple[str, ...]] = {
     "opentelemetry.sdk.trace": ("TracerProvider",),
-    "opentelemetry.sdk.trace.export": ("BatchSpanProcessor",),
+    "opentelemetry.sdk.trace.export": ("BatchSpanProcessor", "SimpleSpanProcessor"),
     "opentelemetry.sdk.resources": ("Resource",),
     "opentelemetry.exporter.otlp.proto.http.trace_exporter": ("OTLPSpanExporter",),
     "opentelemetry.exporter.otlp.proto.http._log_exporter": ("OTLPLogExporter",),
@@ -111,6 +112,7 @@ def _signal_endpoint(endpoint: str, signal: str) -> str:
 _RESOURCE_ATTRIBUTE_KEYS = frozenset({
     "service.name", "service.namespace", "service.version", "service.instance.id",
     "deployment.environment.name", "cloud.provider", "cloud.platform", "cloud.region", "telemetry.scope",
+    "host.name", "hermes.gateway.epoch",
 })
 _SAFE_RESOURCE_VALUE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 
@@ -161,12 +163,48 @@ def _resource_attributes(config: dict[str, Any]) -> dict[str, str]:
     return _runtime_resource_attributes(config, telemetry_scope="gateway_monitoring")
 
 
-def _make_provider(config: dict[str, Any]):
-    sdk = _require_sdk()
-    provider = sdk["TracerProvider"](resource=sdk["Resource"].create(_resource_attributes(config)))
-    processor = sdk["BatchSpanProcessor"](build_exporter(config))
-    provider.add_span_processor(processor)
-    return provider, processor
+def _shutdown_resources(resources: list[list[Any]]) -> bool:
+    """After any failed root, do not trust later no-op shutdowns to retire children."""
+    retired = True
+    for chain in resources:
+        for resource in chain:
+            try:
+                resource.shutdown()
+                if retired:
+                    break  # only an untainted shutdown proves its children retired
+            except BaseException:
+                retired = False
+                logger.debug("OTLP resource cleanup failed", exc_info=True)
+    return retired
+
+
+def _make_provider(config: dict[str, Any], *, _owned: Optional[list[list[Any]]] = None):
+    # Agent traces supplies its lifetime owner; legacy health callers keep the
+    # same (provider, processor) return and original construction exception.
+    resources = _owned if _owned is not None else []
+    try:
+        sdk = _require_sdk()
+        provider = sdk["TracerProvider"](resource=sdk["Resource"].create(_resource_attributes(config)))
+        provider_chain = [provider]
+        resources.append(provider_chain)
+        exporter = build_exporter(config)
+        processor_chain = [exporter]
+        resources.append(processor_chain)
+        processor = sdk["BatchSpanProcessor"](exporter)
+        processor_chain.insert(0, processor)
+        provider.add_span_processor(processor)
+        provider_chain.extend(processor_chain)
+        resources.remove(processor_chain)  # transfer only after attachment succeeds
+        return provider, processor
+    except BaseException:
+        if _owned is None:
+            # No caller can receive partial objects. The daemon retains them;
+            # never block a gateway owner on SDK shutdown in this catch.
+            threading.Thread(
+                target=_shutdown_resources, args=(resources,),
+                name="otlp-startup-cleanup", daemon=True,
+            ).start()
+        raise
 
 
 # ── event -> span attribute mapping ──────────────────────────────────────────

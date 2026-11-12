@@ -1113,18 +1113,17 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         agent._tool_snapshot_generation = 0
     import model_tools
-    from toolsets import agent_tool_drops, session_disabled_toolsets
-    disabled_toolsets = session_disabled_toolsets(disabled_toolsets, getattr(agent, "platform", None))
+    from toolsets import native_delegate_refusal, session_disabled_toolsets
+    disabled_toolsets = session_disabled_toolsets(
+        disabled_toolsets, getattr(agent, "platform", None), native_delegate_denied=native_delegate_refusal(agent) is not None)
     agent.disabled_toolsets = disabled_toolsets  # so the tool_search bridge and delegate children drop them too
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode)
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
     agent.tools = prune_oneshot_tools(agent.tools or [])
-    if drops := agent_tool_drops(agent):
-        agent.tools = [t for t in agent.tools if t["function"]["name"] not in drops]
-
-    agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
+    from tools.mcp_tool_agent import _drop_session_tools
+    agent.tools, agent.valid_tool_names = _drop_session_tools(agent, agent.tools, set())
     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
     # expose kanban_show interactively, and children/cron runs inherit the env var, without
     # owning a task.

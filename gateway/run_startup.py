@@ -26,6 +26,7 @@ from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
 )
+from gateway.agent_trace_emit import _shutdown_agent_trace_plane
 from gateway.run_shutdown import _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
@@ -968,6 +969,12 @@ class GatewayStartupMixin:
             self._gateway_health_export_runtime = start_gateway_health_export(load_config())
             if getattr(self._gateway_health_export_runtime, "enabled", False):
                 logger.info("Gateway health OTLP export: enabled")
+        with _log_suppressed(logging.DEBUG, "agent-trace OTLP plane startup failed", exc_info=True):
+            from hermes_cli.config import load_config as _lc
+            from agent.monitoring.agent_traces import start_agent_trace_plane
+            self._agent_trace_plane = start_agent_trace_plane(await asyncio.to_thread(_lc))
+            if self._agent_trace_plane is not None:
+                logger.info("Agent-trace OTLP plane: enabled")
         # Supply-chain advisories: log only (never block startup or surface to users; only the operator can act).
         with _log_suppressed(logging.DEBUG, "security advisory check failed at gateway startup", exc_info=True):
             from hermes_cli.security_advisories import detect_compromised, gateway_log_message
@@ -1634,9 +1641,14 @@ class GatewayStartupMixin:
 
     async def start(self) -> bool:
         """Start the gateway and all configured platform adapters."""
+        started = False
         try:
-            return await self._start_impl()
+            result = await self._start_impl()
+            started = bool(result) and getattr(self, "_running", False)
+            return result
         finally:
+            if not started:
+                await _shutdown_agent_trace_plane(self)
             # Every startup path (early aborts included) ends here: bound startup on the latest
             # diagnostic snapshot once, instead of flushing at each return.
             await self._start_flush_runtime_status()

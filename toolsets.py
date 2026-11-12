@@ -449,18 +449,90 @@ def get_toolset_names() -> list[str]:
     return sorted(set(TOOLSETS.keys()) | set(_plugin_display_names()))
 
 
-def session_platform_tool_drops(platform: Optional[str]) -> frozenset:
-    """Tools of every platform-gated toolset that a session on *platform* does not get."""
-    return frozenset(tool for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms
-                     for tool in resolve_toolset(name))
+def session_platform_tool_drops(platform: Optional[str], *, native_delegate_denied: Optional[bool] = None) -> frozenset:
+    """Platform-gated tools, plus the exact native spawn schema (controls are injected separately)."""
+    drops = frozenset(tool for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms
+                      for tool in resolve_toolset(name))
+    denied = (acp_delegate_refusal(platform) is not None if native_delegate_denied is None
+              else native_delegate_denied or platform == "acp")
+    if denied:
+        drops = drops | {"delegate_task"}
+    return drops
 
 
-def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str]) -> Optional[list[str]]:
+def acp_delegate_refusal(platform: Optional[str]) -> Optional[str]:
+    """ACP platform cannot be weakened by a conflicting session-source label."""
+    from agent.session_source import session_source_for
+    if platform == "acp" or session_source_for(platform) == "acp":
+        return ("delegate_task is disabled for editor-hosted sessions: delegate through the "
+                "editor's namespaced delegate_task tool instead. [disabled by policy]")
+    return None
+
+
+def gateway_hosted_process() -> bool:
+    """True inside a process that has hosted at least one gateway session.
+
+    Session-context binding is the transport-level fact: standalone CLI/oneshot
+    processes never bind it. Policy follows the host process, not profile or
+    toolset state, so no profile/toolset change can re-arm native spawning on
+    the gateway; agent None is equally refused there (no parent-agent bypass).
+    """
+    try:
+        from gateway.session_context import session_context_engaged
+    except Exception:
+        return False
+    return bool(session_context_engaged())
+
+
+def native_delegate_refusal(agent: Any) -> Optional[str]:
+    """Pin transport policy on the host-owned agent, never on model arguments.
+
+    Resolve the source only once: a later tool thread may have no session context,
+    or another session may be bound there. ACP platform is always restrictive, and
+    a gateway-hosted process denies native spawning for EVERY session regardless
+    of platform, profile or toolset changes; standalone processes are unchanged.
+    """
+    if gateway_hosted_process():
+        return ("delegate_task spawning is disabled for gateway-hosted sessions: delegate new "
+                "work through the editor's namespaced delegate_task tool. Existing children "
+                "remain available via delegate_task(action='list'/'steer'/'stop'). "
+                "[disabled by policy]")
+    if agent is None:
+        return acp_delegate_refusal(None)
+    denied = getattr(agent, "_native_delegate_spawn_denied", None)
+    if not isinstance(denied, bool):
+        denied = acp_delegate_refusal(getattr(agent, "platform", None)) is not None
+        agent._native_delegate_spawn_denied = denied
+    if denied or getattr(agent, "platform", None) == "acp":
+        return ("delegate_task spawning is disabled for editor-hosted sessions; use the "
+                "editor's namespaced delegate_task. Existing children remain available via "
+                "delegate_task(action='list'/'steer'/'stop'). [disabled by policy]")
+    return None
+
+
+def native_delegate_control_tools(agent: Any, tools: list) -> list:
+    """Keep an eager, control-only native schema; never rewrite namespaced tools."""
+    if native_delegate_refusal(agent) is None:
+        return tools
+    from copy import deepcopy
+    from tools.delegate_tool import DELEGATE_CONTROL_SCHEMA
+    control = {"type": "function", "function": deepcopy(DELEGATE_CONTROL_SCHEMA)}
+    if any(t["function"]["name"] == "delegate_task" for t in tools):
+        return [control if t["function"]["name"] == "delegate_task" else t for t in tools]
+    return [*tools, control]
+
+
+def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[str], *,
+                              native_delegate_denied: Optional[bool] = None) -> Optional[list[str]]:
     """*disabled* plus every platform-gated toolset a session on *platform* does not get. An agent stores
     this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
     and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()
              if platform not in platforms and name not in (disabled or ())]
+    denied = (acp_delegate_refusal(platform) is not None if native_delegate_denied is None
+              else native_delegate_denied or platform == "acp")
+    if denied and "delegation" not in (disabled or ()):
+        gated.append("delegation")
     return [*(disabled or ()), *gated] if gated else disabled
 
 
@@ -468,7 +540,8 @@ def agent_tool_drops(agent: Any) -> frozenset:
     """Tool names *agent* never carries, whatever its toolsets resolved to: the side-agent drops and
     the toolsets its session platform does not get. Applied at load, MCP refresh and prefix restore."""
     from tools.connectors.turn import side_agent_tool_drops
-    return side_agent_tool_drops(agent) | session_platform_tool_drops(getattr(agent, "platform", None))
+    return side_agent_tool_drops(agent) | session_platform_tool_drops(
+        getattr(agent, "platform", None), native_delegate_denied=native_delegate_refusal(agent) is not None)
 
 
 def validate_toolset(name: str) -> bool:

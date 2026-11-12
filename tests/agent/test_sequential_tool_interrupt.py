@@ -13,8 +13,12 @@ synthesizes a cancelled tool result and abandons the worker.
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
+
+from tools.interrupt import is_interrupted, is_thread_interrupted, set_interrupt
+from tests.waiting import wait_until
 
 from agent import tool_executor
 from agent.tool_executor import (
@@ -34,7 +38,10 @@ class _FakeAgent:
         self.activity.append(msg)
 
 @pytest.fixture()
-def fake_agent():
+def fake_agent(monkeypatch):
+    # This executor-only fixture needs real tool interrupt bits, not AIAgent bootstrap.
+    interrupt_api = SimpleNamespace(_set_interrupt=set_interrupt)
+    monkeypatch.setattr(tool_executor, "_ra", lambda: interrupt_api)
     return _FakeAgent()
 
 @pytest.fixture(autouse=True)
@@ -53,10 +60,13 @@ def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_p
     """A blocking tool is abandoned within ~poll+grace once interrupted."""
 
     started = threading.Event()
+    release = threading.Event()
+    workers = []
 
     def _fake_middleware(agent_arg, **kwargs):
+        workers.append(threading.current_thread())
         started.set()
-        time.sleep(30)  # non-cooperative: never checks is_interrupted()
+        release.wait(30)  # non-cooperative: ignores the real interrupt bit
         return _ManagedToolResult(
             result="late result", args={}, middleware_trace=[],
             blocked=False, dispatched=True,
@@ -70,30 +80,44 @@ def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_p
     )
 
     def _interrupt_soon():
-        started.wait(5)
-        time.sleep(0.1)
-        fake_agent._interrupt_requested = True
+        if started.wait(5):
+            fake_agent._interrupt_requested = True
 
-    threading.Thread(target=_interrupt_soon, daemon=True).start()
+    interrupter = threading.Thread(target=_interrupt_soon, daemon=True)
+    interrupter.start()
 
-    t0 = time.monotonic()
-    managed = _run_sequential_tool_execution_middleware(
-        fake_agent,
-        function_name="image_generate",
-        function_args={"prompt": "x"},
-        effective_task_id="t",
-        tool_call_id="call_1",
-        execute=lambda a: "unused",
-    )
-    elapsed = time.monotonic() - t0
+    try:
+        t0 = time.monotonic()
+        managed = _run_sequential_tool_execution_middleware(
+            fake_agent,
+            function_name="image_generate",
+            function_args={"prompt": "x"},
+            effective_task_id="t",
+            tool_call_id="call_1",
+            execute=lambda a: "unused",
+        )
+        elapsed = time.monotonic() - t0
 
-    assert isinstance(managed.result, _ToolCancelledResult)
-    assert "cancelled" in str(managed.result)
-    # poll (0.05s) + interrupt delay (0.1s) + grace (3s) + slack — nowhere
-    # near the 30s tool runtime.
-    assert elapsed < 10.0
-    # The executor emitted the terminal post_tool_call itself.
-    assert any(kw.get("status") == "cancelled" for kw in _fast_polls)
+        assert started.is_set()
+        assert isinstance(managed.result, _ToolCancelledResult)
+        assert "cancelled" in str(managed.result)
+        # Real poll + real 3s grace + slack, not the blocked tool's 30s wait.
+        assert elapsed < 10.0
+        assert elapsed >= 3.0
+        assert workers[0].is_alive()  # result returned before the tool was released
+        assert is_thread_interrupted(workers[0].ident)
+        assert len(_fast_polls) == 1
+        assert _fast_polls[0]["status"] == "cancelled"
+    finally:
+        release.set()
+        interrupter.join(5)
+        for worker in workers:
+            worker.join(5)
+    assert not interrupter.is_alive()
+    assert not workers[0].is_alive()
+    assert not fake_agent._tool_worker_threads
+    assert not is_thread_interrupted(workers[0].ident)
+    assert len(_fast_polls) == 1
 
 def test_interrupt_prefers_real_result_from_cooperative_tool(
     monkeypatch, fake_agent, _fast_polls
@@ -101,8 +125,8 @@ def test_interrupt_prefers_real_result_from_cooperative_tool(
     """A tool that finishes within the grace window returns its real result."""
 
     def _fake_middleware(agent_arg, **kwargs):
-        # Cooperative-ish: returns quickly once running (well inside grace).
-        time.sleep(0.3)
+        # Finish only after the executor fans out the real per-thread interrupt.
+        wait_until(is_interrupted, timeout=5, what="worker interrupt fan-out")
         return _ManagedToolResult(
             result="real result", args={}, middleware_trace=[],
             blocked=False, dispatched=True,
