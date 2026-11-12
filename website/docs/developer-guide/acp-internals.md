@@ -17,7 +17,6 @@ Key implementation files:
 - `acp_adapter/permissions.py`
 - `acp_adapter/tools.py`
 - `acp_adapter/auth.py`
-- `acp_registry/agent.json`
 
 ## Boot flow
 
@@ -31,9 +30,47 @@ hermes acp / hermes-acp / python -m acp_adapter
   -> acp.run_agent(agent, use_unstable_protocol=True)
 ```
 
-The Zed ACP Registry path launches the same adapter through `uvx --from 'hermes-agent[acp]==<version>' hermes-acp`, pointed at the `hermes-agent` PyPI release.
-
 Stdout is reserved for ACP JSON-RPC transport. Human-readable logs go to stderr.
+
+### Cheap hosted connections and editor MCP
+
+On Unix, a running gateway exposes an owned mode-0600 ACP socket. `hermes acp`
+uses a stdlib-only relay rather than loading another agent runtime. If that
+socket is unavailable, the existing stdio projection remains the fallback.
+
+Hosted projections also accept the connection-oriented MCP-over-ACP proposal:
+`mcpCapabilities.acp` selects `{type: "acp", name, serverId}` server descriptors.
+The gateway reuses its native MCP discovery, tool registry and `ClientSession`
+over bounded in-memory streams; no stdio MCP helper process is needed.
+`acp_adapter/mcp_tunnel.py` keeps the SDK schema/wire compatibility local to each
+connection rather than modifying installed SDK classes. This implements the
+connection-oriented `mcp/connect`, `mcp/message`, and `mcp/disconnect` contract,
+not the newer stateless proposal that uses the same capability name.
+
+Live transport references are private, process-local authority, never persisted
+in session policy or receipts. Session tool scopes remain separate, including
+forks. Another live editor cannot replace a session's existing ACP-MCP owner
+just by supplying matching server names. An authorized resume can supply a new
+transport after the previous owner disconnects. Frozen schemas still change
+only at the existing session boundaries.
+
+Closing a projection invalidates its transport references and fails pending
+requests. The relay disconnects editor-side MCP sessions when its gateway
+connection is lost, including late replies to old connection requests. Already
+sent tool calls are never replayed after transport loss; their outcome must be
+checked before re-invocation. Legacy stdio/HTTP/SSE servers retain their existing
+transports and discovery path.
+
+### Gateway terminal projection
+
+`acp_adapter/gateway_server.py` waits for the completion of the exact submitted
+admission. A cancelled admission returns `stopReason: cancelled`; a failed
+admission raises an ACP request error rather than reporting `end_turn`. Ordinary
+completion still returns `end_turn`. Cancellation while waiting for the model
+suppresses the local `Operation interrupted: waiting for model response` status
+message; actual partial assistant text remains visible. Terminal outcomes come
+from the gateway's structured execution result, not from assistant prose or a
+session-wide cancellation flag.
 
 ## Major components
 
@@ -82,6 +119,12 @@ Bridged callbacks:
 - `thinking_callback` (currently set to `None` in the ACP bridge — reasoning is forwarded through `step_callback` instead)
 - `step_callback`
 
+Every ACP tool call reaches a terminal status: `tool.completed` closes the call with its own
+result (`completed` / `failed`), the `step_callback` `prev_tools` pass is only a fallback for
+runtimes that never project a completion, and anything still open when the turn ends —
+a denied or blocked call, an interrupted one — is marked `failed` before the response is
+returned.
+
 Because `AIAgent` runs in a worker thread while ACP I/O lives on the main event loop, the bridge uses:
 
 ```python
@@ -116,7 +159,10 @@ Examples:
 ```text
 new_session(cwd)
   -> create SessionState
-  -> create AIAgent(platform="acp", enabled_toolsets=["hermes-acp"])
+  -> create AIAgent(platform="acp", enabled_toolsets=<_get_platform_tools(config, "acp"), as on the
+                   gateway: platform_toolsets.acp (default hermes-acp) plus the resolver's extras
+                   such as plugin toolsets, with its admitted MCP servers keyed mcp-<server>>,
+                   disabled_toolsets=<agent.disabled_toolsets>)
   -> bind task_id/session_id to cwd override
 
 prompt(..., session_id)
@@ -127,6 +173,13 @@ prompt(..., session_id)
   -> update session history
   -> emit final agent message chunk
 ```
+
+A turn that ends in a terminal failure (provider refusal, non-retryable error, exhausted
+retries, interrupt before any reply) is closed by the core loop with a Hermes-authored
+assistant row ("Your request was not processed…" / "This turn did not complete…") so the
+durable transcript never ends on an open `user` row. Without it the next prompt would be
+merged into the failed request and replayed. Context-overflow failures are exempt: their
+repair is session rotation, not another row.
 
 ### Cancelation
 
@@ -149,7 +202,7 @@ Instead it reuses Hermes' runtime resolver:
 - `acp_adapter/auth.py`
 - `hermes_cli/runtime_provider.py`
 
-So ACP advertises and uses the currently configured Hermes provider/credentials. It also always advertises a terminal setup auth method (`hermes-setup`, args `--setup`) so first-run registry clients can open Hermes' interactive model/provider configuration before starting a normal ACP session.
+So ACP advertises and uses the currently configured Hermes provider/credentials. It also always advertises a terminal setup auth method (`hermes-setup`, args `--setup`) so first-run ACP clients can open Hermes' interactive model/provider configuration before starting a normal ACP session.
 
 ## Working directory binding
 
@@ -178,7 +231,7 @@ ACP temporarily installs an approval callback on the terminal tool during prompt
 
 ## Related files
 
-- `tests/acp/` — ACP test suite
+- `tests/acp_adapter/` — ACP test suite
 - `toolsets.py` — `hermes-acp` toolset definition
 - `hermes_cli/main.py` — `hermes acp` CLI subcommand
 - `pyproject.toml` — `[acp]` optional dependency + `hermes-acp` script
