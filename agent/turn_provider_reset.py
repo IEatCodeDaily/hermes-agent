@@ -82,9 +82,10 @@ def wait_for_provider_reset(agent, error, classified, context, retry, *,
         reset_at = time.time() + seconds
         extra = ' '.join(f"{k}={context[k]}" for k in
                          ('limit_code', 'limit_kind', 'limit_scope', 'scope') if k in context)
+        reason = getattr(classified, 'reason', None)
         detail = (f"provider_limit: provider={getattr(agent, 'provider', '') or '?'} "
                   f"model={getattr(agent, 'model', '') or '?'} "
-                  f"kind={getattr(classified.reason, 'value', classified.reason)} "
+                  f"kind={getattr(reason, 'value', reason) or '?'} "
                   f"reset_at={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(reset_at))}"
                   + (f" {extra}" if extra else ""))
         return _terminal_failure(messages, api_call_count, 'provider_limit', detail)

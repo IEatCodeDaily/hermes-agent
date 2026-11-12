@@ -30,7 +30,8 @@ def test_reset_grammar(message, seconds):
 def test_structured_limit_fields_pass_through():
     body = {'code': 'rate_limit_error', 'scope': 'combo', 'reset_at': 1794400000,
             'error': {'code': 'inner', 'limit_kind': 'usage'}}
-    assert _structured_limit_context(body) == {'limit_code': 'rate_limit_error', 'scope': 'combo'}
+    assert _structured_limit_context(body) == {
+        'limit_code': 'rate_limit_error', 'scope': 'combo', 'limit_kind': 'usage'}
     assert _structured_limit_context({'error': {'limit_kind': 'usage'}}) == {'limit_kind': 'usage'}
     assert _structured_limit_context(None) == {}
 
