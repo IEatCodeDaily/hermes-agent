@@ -117,8 +117,8 @@ def _exception_status(error: BaseException) -> str:
 
 
 class _ToolTrace:
-    def __init__(self, call_id: str, name: str) -> None:
-        self.call_id, self.name = call_id, name
+    def __init__(self, call_id: str, name: str, tool_origin: Optional[str] = None) -> None:
+        self.call_id, self.name, self.tool_origin = call_id, name, tool_origin
         self.started = time.monotonic_ns()
         self.result: Any = None
 
@@ -144,6 +144,7 @@ class _ExecutionTrace:
             phase=phase, session_ref=pseudonymize_id(self.identity[0]),
             turn_ref=pseudonymize_id(self.identity[1]), tool_call_id=tool.call_id,
             tool_name=tool.name, ts_ns=ts_ns, status=status, error_class=error_class,
+            tool_origin=tool.tool_origin,
             duration_ms=(time.monotonic_ns() - tool.started) // 1_000_000 if phase == "end" else None,
         ))
 
@@ -212,10 +213,10 @@ def trace_execution(agent: Any, session_id: str, turn_id: str):
 
 
 @contextmanager
-def trace_tool(call_id: str, tool_name: str):
+def trace_tool(call_id: str, tool_name: str, tool_origin: Optional[str] = None):
     """Wrap only real dispatch; inherited context keeps late workers on their original owner."""
     trace = _EXECUTION.get()
-    tool = _ToolTrace(call_id, tool_name)
+    tool = _ToolTrace(call_id, tool_name, tool_origin)
     status, error_class = "completed", None
     if trace is not None:
         with suppress(Exception):  # Optional telemetry cannot prevent real dispatch.

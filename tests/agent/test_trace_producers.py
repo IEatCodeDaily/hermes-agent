@@ -86,6 +86,21 @@ def test_tool_exception_has_one_terminal_with_type_only(events, error, status):
     assert "private" not in repr(events)
 
 
+def test_tool_origin_rides_tool_events(events):
+    from agent.tool_executor import _tool_origin
+    assert _tool_origin("mcp__executor__execute") == "mcp:executor"
+    assert _tool_origin("mcp__grafana__query_prometheus") == "mcp:grafana"
+    assert _tool_origin("execute") == "native"
+    with tracing.trace_execution(_agent(), "s", "t"):
+        with tracing.trace_tool("call1", "mcp__executor__execute", "mcp:executor"):
+            pass
+        with tracing.trace_tool("call2", "execute", "native"):
+            pass
+    tools = [e for e in events if isinstance(e, AgentToolExecEvent) and e.phase == "end"]
+    assert [(e.tool_name, e.tool_origin) for e in tools] == [
+        ("mcp__executor__execute", "mcp:executor"), ("execute", "native")]
+
+
 def test_late_worker_end_cannot_reparent_or_duplicate(events):
     started, release = threading.Event(), threading.Event()
     agent = _agent()

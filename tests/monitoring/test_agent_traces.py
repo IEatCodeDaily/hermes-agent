@@ -1069,3 +1069,20 @@ def test_actual_stop_drains_queued_terminal_before_detach_and_restart(monkeypatc
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_tool_origin_allowlisted_into_span():
+    plane, sink = _plane_and_sink()
+    try:
+        plane.handle({"event": "agent_turn_start", "session_ref": "s", "turn_ref": "t"})
+        plane.handle({"event": "agent_tool_exec", "phase": "start", "session_ref": "s",
+                      "turn_ref": "t", "tool_call_id": "tc1", "tool_name": "mcp__executor__execute",
+                      "tool_origin": "mcp:executor", "ts_ns": 100})
+        plane.handle({"event": "agent_tool_exec", "phase": "end", "session_ref": "s",
+                      "turn_ref": "t", "tool_call_id": "tc1", "tool_name": "mcp__executor__execute",
+                      "tool_origin": "mcp:executor", "status": "completed", "ts_ns": 150})
+        plane.handle({"event": "agent_turn_end", "session_ref": "s", "turn_ref": "t"})
+        span, = [s for s in sink.get_finished_spans() if s.name == "agent.tool"]
+        assert dict(span.attributes)["hermes.tool_origin"] == "mcp:executor"
+    finally:
+        plane.shutdown()

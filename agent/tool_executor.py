@@ -756,12 +756,18 @@ def _dispatch_authorized_once(
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
         try:
             from gateway.agent_trace_emit import trace_tool
-            with trace_tool(ref.call_id, ref.name) as tool_trace:
+            with trace_tool(ref.call_id, ref.name, _tool_origin(ref.name)) as tool_trace:
                 result = _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
                 tool_trace.result = result
                 return result
         finally:
             state.data_use = frozenset(data_use)
+
+
+def _tool_origin(tool_name: str) -> str:
+    """Dispatch origin for the trace plane: "mcp:<server>" for MCP tools (Executor
+    tools arrive as mcp:executor), "native" otherwise. Name-derived, content-free."""
+    return f"mcp:{tool_name.split('__')[1]}" if tool_name.startswith("mcp__") else "native"
 
 
 def _run_agent_tool_execution_middleware(

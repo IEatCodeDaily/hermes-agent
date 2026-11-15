@@ -149,6 +149,9 @@ class AgentToolExecEvent(_MonitoringEvent):
     error_class: Optional[str] = None
     ts_ns: int = field(default_factory=time.time_ns)
     status: Optional[str] = None  # completed | failed | cancelled | interrupted | abandoned
+    # Dispatch origin: "native" or "mcp:<server>" (Executor tools arrive as
+    # mcp:executor). Name-derived, content-free; appended, never reordered.
+    tool_origin: Optional[str] = None
 
 
 @dataclass(slots=True)

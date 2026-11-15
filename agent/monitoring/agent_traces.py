@@ -74,6 +74,7 @@ _ATTR_ALLOWLIST: dict[str, Iterable[str]] = {
     "agent.tool": (
         "tool_call_id",
         "tool_name",
+        "tool_origin",
         "duration_ms",
         "error_class",
         "status",
