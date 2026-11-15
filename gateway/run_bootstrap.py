@@ -371,6 +371,13 @@ async def _start_gateway_start_control_socket(runner):
             # Hosted-room transports install onto this listener; bind it here so every launcher
             # that starts the control socket (not only start_gateway) exposes it.
             runner.session_control_server = _control_server
+            from gateway import handover as _handover
+            if _handover.handover_from_env() is not None:
+                # Green is serving: point systemd's MainPID here so blue's exit (still draining
+                # its established connections) does not trigger Restart=always behind us.
+                from gateway import systemd_notify
+                if systemd_notify.notify_mainpid(os.getpid()):
+                    logger.info("Blue-green handover: successor (PID %d) took over as MainPID", os.getpid())
     except Exception as _cs_exc:
         logger.error("Control socket startup failed; the gateway cannot start without it: %s", _cs_exc)
         _control_server = None
@@ -795,7 +802,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
     # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
     # owner over already freed the lock with that process.
-    if not _start_gateway_claim_pid_file(force=force):
+    # A blue-green handover successor defers the claim instead: the predecessor owns the record
+    # until it exits, and the deferred task (armed after the control socket serves) takes it over.
+    from gateway import handover as _handover
+    _handover_ctx = _handover.handover_from_env()
+    if _handover_ctx is not None:
+        logger.info("Blue-green handover: this boot succeeds gateway PID %d", _handover_ctx.parent_pid)
+        _handover.deferred_pid_claim(_handover_ctx)
+    elif not _start_gateway_claim_pid_file(force=force):
         release_gateway_runtime_lock()
         return False
 
@@ -817,7 +831,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _enable_multiplex_log_routing(runner.config)
         # ``--replace`` is explicit startup authority, not a durable reconnect policy: GatewayRunner scopes
         # it to cold adapter connects and clears it before the background reconnect watcher starts.
-        runner._platform_lock_takeover_on_start = bool(replace)
+        # A blue-green handover successor carries the same authority over its predecessor.
+        runner._platform_lock_takeover_on_start = bool(replace) or _handover_ctx is not None
 
         # Unexpected signals exit non-zero so service managers revive us; planned stops write a marker first.
         _signal_initiated_shutdown = [False]

@@ -1697,9 +1697,22 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._mark_api_runs_shutdown_requested()
 
         async def _run_restart() -> None:
+            # Blue-green handover: the successor boots FIRST, so new sessions land on it while
+            # blue keeps serving established connections through its drain. If green is not
+            # ready in time, fall through to the classic drain-exit restart unchanged.
+            handover_pid: int | None = None
+            from gateway import handover as _handover
+            if _handover.enabled(self.config):
+                handover_pid = await _handover.spawn_successor()
+                if handover_pid is None or not await _handover.wait_successor_ready(handover_pid):
+                    logger.warning("Blue-green handover did not become ready (pid=%s); "
+                                   "falling back to the drain-exit restart", handover_pid)
+                    handover_pid = None
             await self._await_active_work_before_restart()
             # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
-            if detached:
+            # Never when the handover succeeded: systemd's MainPID is already the successor, and a
+            # post-exit `gateway restart` would bounce the new gateway for nothing.
+            if detached and handover_pid is None:
                 with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
                     await self._launch_detached_restart_command()
             await asyncio.sleep(0.05)
