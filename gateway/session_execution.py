@@ -231,4 +231,9 @@ class GatewaySessionAgentMixin:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        # A T3 delegate_task child fails fast on provider limits instead of parking; the
+        # flag rides the session's frozen launch config and is re-read every turn so a
+        # cached agent built before the mark landed still picks it up.
+        from gateway.session_policy import config_flag, policy_for_source, T3_DELEGATED
+        agent._t3_delegated = config_flag(policy_for_source(runner, ctx.source), T3_DELEGATED)
         return agent, found.reused

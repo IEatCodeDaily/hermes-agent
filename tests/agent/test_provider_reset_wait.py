@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import FailoverReason, classify_api_error, _structured_limit_context
 from agent.retry_utils import reset_delay_from_message
 from agent.turn_retry_state import TurnRetryState
 
@@ -25,6 +25,15 @@ def test_relay_503_is_rate_limit_with_reset():
     ('resets in 2h 3m 4s', 7384), ('reset after 1 hour 2 minutes', 3720)])
 def test_reset_grammar(message, seconds):
     assert reset_delay_from_message(message) == seconds
+
+
+def test_structured_limit_fields_pass_through():
+    body = {'code': 'rate_limit_error', 'scope': 'combo', 'reset_at': 1794400000,
+            'error': {'code': 'inner', 'limit_kind': 'usage'}}
+    assert _structured_limit_context(body) == {
+        'limit_code': 'rate_limit_error', 'scope': 'combo', 'limit_kind': 'usage'}
+    assert _structured_limit_context({'error': {'limit_kind': 'usage'}}) == {'limit_kind': 'usage'}
+    assert _structured_limit_context(None) == {}
 
 
 def test_declared_wait_precedes_recovery_and_preserves_eight_attempt_budget(monkeypatch):
@@ -57,7 +66,7 @@ def test_bounded_wait_and_interrupt(monkeypatch):
     now = 1000.0
     monkeypatch.setattr(waiting.time, 'monotonic', lambda: now)
     monkeypatch.setattr(waiting.time, 'time', lambda: now)
-    agent = Mock()
+    agent = Mock(provider='custom', model='opus')
     retry = TurnRetryState()
     classified = SimpleNamespace(retryable=True)
     error = RuntimeError('limited')
@@ -67,7 +76,9 @@ def test_bounded_wait_and_interrupt(monkeypatch):
     assert waiting.wait_for_provider_reset(agent, error, classified, {'reset_at': now + 1800}, retry, **args) == ('continue', None)
     assert 300 <= sleeps[0] <= 331
     now += waiting.PROVIDER_RESET_WAIT_CAP_S
-    assert waiting.wait_for_provider_reset(agent, error, classified, {'reset_at': now + 10}, retry, **args) is None
+    action, payload = waiting.wait_for_provider_reset(agent, error, classified, {'reset_at': now + 10}, retry, **args)
+    assert action == 'return' and payload['failed'] is True
+    assert payload['failure_reason'] == 'provider_limit_wait_cap'
     assert len(sleeps) == 1
     retry = TurnRetryState(restart_with_redirected_messages=True)
     assert waiting.wait_for_provider_reset(agent, error, classified, {'reset_at': now + 10}, retry, **args) == ('break', None)
@@ -77,7 +88,72 @@ def test_bounded_wait_and_interrupt(monkeypatch):
     assert waiting.wait_for_provider_reset(agent, error, classified, {'reset_at': now + 10}, retry, **args) == ('return', interrupted)
 
 
-@pytest.mark.parametrize('source', ['header', 'absolute'])
+def test_park_notice_exactly_once_and_resume_notice_once(monkeypatch):
+    from agent import turn_provider_reset as waiting
+    from agent.turn_provider_reset import close_provider_limit_episode
+    now = 1000.0
+    monkeypatch.setattr(waiting.time, 'monotonic', lambda: now)
+    monkeypatch.setattr(waiting.time, 'time', lambda: now)
+    agent = Mock(provider='custom', model='opus')
+    sleeps = []
+    monkeypatch.setattr(waiting, 'interruptible_backoff_sleep', lambda *a, **k: sleeps.append(a[1]))
+    retry = TurnRetryState()
+    classified = SimpleNamespace(retryable=True)
+    error = RuntimeError('limited')
+    args = dict(messages=[], conversation_history=[], api_call_count=1)
+    context = {'reset_at': now + 3600}
+    assert waiting.wait_for_provider_reset(agent, error, classified, context, retry, **args) == ('continue', None)
+    assert waiting.wait_for_provider_reset(agent, error, classified, context, retry, **args) == ('continue', None)
+    warnings = [c.args[0] for c in agent._emit_warning.call_args_list]
+    assert len(warnings) == 1
+    assert 'Stuck on provider limit: custom/opus' in warnings[0]
+    assert 'resets ~' in warnings[0] and 'auto-retrying every 5 min' in warnings[0]
+    close_provider_limit_episode(agent, retry)
+    close_provider_limit_episode(agent, retry)
+    resumes = [c.args[0] for c in agent._emit_warning.call_args_list][1:]
+    assert len(resumes) == 1 and 'Resumed at' in resumes[0]
+
+
+def test_delegate_child_fails_fast_structured(monkeypatch):
+    from agent import turn_provider_reset as waiting
+    monkeypatch.setattr('agent.delegation_context.is_delegated_child_process_context', lambda: True)
+    agent = Mock(provider='custom', model='opus')
+    sleeps = []
+    monkeypatch.setattr(waiting, 'interruptible_backoff_sleep', lambda *a, **k: sleeps.append(a[1]))
+    classified = SimpleNamespace(retryable=True, reason=SimpleNamespace(value='rate_limit'))
+    action, payload = waiting.wait_for_provider_reset(
+        agent, RuntimeError('limited'), classified,
+        {'reset_at': waiting.time.time() + 600, 'scope': 'combo'},
+        TurnRetryState(), messages=[], conversation_history=[], api_call_count=1)
+    assert action == 'return' and payload['failed'] is True
+    assert payload['failure_reason'] == 'provider_limit'
+    assert 'provider=custom' in payload['error'] and 'model=opus' in payload['error']
+    assert 'kind=rate_limit' in payload['error'] and 'reset_at=' in payload['error']
+    assert 'scope=combo' in payload['error']
+    assert sleeps == []
+
+
+def test_gateway_stamped_t3_child_fails_fast(monkeypatch):
+    from agent import turn_provider_reset as waiting
+    agent = Mock(provider='custom', model='opus')
+    agent._t3_delegated = True
+    sleeps = []
+    monkeypatch.setattr(waiting, 'interruptible_backoff_sleep', lambda *a, **k: sleeps.append(a[1]))
+    action, payload = waiting.wait_for_provider_reset(
+        agent, RuntimeError('limited'), SimpleNamespace(retryable=True),
+        {'reset_at': waiting.time.time() + 600}, TurnRetryState(),
+        messages=[], conversation_history=[], api_call_count=1)
+    assert action == 'return' and payload['failure_reason'] == 'provider_limit'
+    assert sleeps == []
+
+
+def test_no_declared_reset_is_an_ordinary_error():
+    from agent.turn_provider_reset import wait_for_provider_reset
+    assert wait_for_provider_reset(Mock(provider='custom', model='opus'), RuntimeError('bad'),
+        SimpleNamespace(retryable=True), {}, TurnRetryState(),
+        messages=[], conversation_history=[], api_call_count=1) is None
+
+
 def test_header_and_absolute_reset_are_not_capped_at_ten_minutes(monkeypatch, source):
     from agent import turn_provider_reset as waiting
     error = RuntimeError('busy')
@@ -85,7 +161,7 @@ def test_header_and_absolute_reset_are_not_capped_at_ten_minutes(monkeypatch, so
     context = {} if source == 'header' else {'reset_at': waiting.time.time() + 1800}
     sleeps = []
     monkeypatch.setattr(waiting, 'interruptible_backoff_sleep', lambda *a, **k: sleeps.append(a[1]))
-    assert waiting.wait_for_provider_reset(Mock(), error, SimpleNamespace(retryable=True), context,
+    assert waiting.wait_for_provider_reset(Mock(provider='custom', model='opus'), error, SimpleNamespace(retryable=True), context,
         TurnRetryState(), messages=[], conversation_history=[], api_call_count=1) == ('continue', None)
     assert 300 <= sleeps[0] <= 331
 
@@ -101,7 +177,7 @@ def test_generic_overload_and_billing_are_not_reclassified():
 @pytest.mark.parametrize('reset', [None, 'garbage', float('inf'), float('nan'), -1])
 def test_invalid_reset_never_parks(reset):
     from agent.turn_provider_reset import wait_for_provider_reset
-    assert wait_for_provider_reset(Mock(), RuntimeError('bad'), SimpleNamespace(retryable=True),
+    assert wait_for_provider_reset(Mock(provider='custom', model='opus'), RuntimeError('bad'), SimpleNamespace(retryable=True),
         {'reset_at': reset}, TurnRetryState(), messages=[], conversation_history=[], api_call_count=1) is None
 
 def test_five_hour_reset_parks_in_probe_intervals(monkeypatch):
@@ -111,7 +187,7 @@ def test_five_hour_reset_parks_in_probe_intervals(monkeypatch):
     now = 1000.0
     monkeypatch.setattr(waiting.time, "monotonic", lambda: now)
     monkeypatch.setattr(waiting.time, "time", lambda: now)
-    agent = Mock()
+    agent = Mock(provider='custom', model='opus')
     sleeps = []
     monkeypatch.setattr(waiting, "interruptible_backoff_sleep", lambda *a, **k: sleeps.append(a[1]))
     retry = TurnRetryState()
@@ -125,4 +201,6 @@ def test_five_hour_reset_parks_in_probe_intervals(monkeypatch):
     assert waiting.wait_for_provider_reset(agent, error, classified, context, retry, **args) == ("continue", None)
     assert len(sleeps) == 2
     now += waiting.PROVIDER_RESET_WAIT_CAP_S + sleeps[0]
-    assert waiting.wait_for_provider_reset(agent, error, classified, {"reset_at": now + 3600}, retry, **args) is None
+    action, payload = waiting.wait_for_provider_reset(agent, error, classified, {"reset_at": now + 3600}, retry, **args)
+    assert action == "return" and payload["failed"] is True
+    assert payload["failure_reason"] == "provider_limit_wait_cap"

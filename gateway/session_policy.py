@@ -16,7 +16,8 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+                           't3_delegated'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -32,11 +33,22 @@ FOLLOW_ADOPTED = 'follow_adopted'
 # an exact create retry from a socket whose declaration has not landed carries the same creation request,
 # and ``launch_request`` never echoes it.
 LOCAL_DESKTOP_CHAT = 'desktop_local'
+# A T3 Code delegate_task child session (the ACP relay's own thread is a subagent): its runs
+# fail fast on provider limits instead of parking — the parent thread decides what to do.
+T3_DELEGATED = 't3_delegated'
 # A launch field's state as a committed session edit left it, in the policy's own config: ``True`` the
 # session chose it (``/reasoning <level>``, a model pick carrying one), ``False`` a reset gave it back to
 # the profile. Either wins over the creation request (the launch identity, never rewritten) and the older
 # pick receipts.
 SESSION_PINS = 'session_pins'
+
+
+def config_flag(policy, key: str) -> bool:
+    """True when the session's frozen launch config carries a True ``key`` mark."""
+    try:
+        return json.loads(policy.config_json).get(key) is True
+    except Exception:
+        return False
 
 
 def session_pinned(config, field, launched):

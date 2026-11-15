@@ -360,6 +360,34 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             self._failure = None
             self._changed.notify_all()
 
+    _t3_kind_cache: bool | None = None
+
+    async def _t3_delegated(self) -> bool:
+        """Whether this ACP session is a T3 Code delegate_task child: the thread-bound MCP
+        credential reads its own thread, and ``relationshipToParent == 'subagent'`` marks it.
+        False outside T3 and on any failure — fail-open to the visible top-level park."""
+        if self._t3_kind_cache is not None:
+            return self._t3_kind_cache
+        self._t3_kind_cache = False
+        env = self._environ
+        node = env.get("T3_ACP_MCP_NODE")
+        if not (node and env.get("T3_ACP_MCP_ENDPOINT") and env.get("T3_ACP_MCP_AUTHORIZATION")):
+            return False
+        import json
+        entry = env.get("T3_ACP_MCP_ENTRYPOINT")
+        argv = [node, *([entry] if entry else []), "acp-mcp-call", "t3_thread_read",
+                json.dumps({"limit": 1, "maxCharsPerItem": 200})]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, env={**os.environ, **env, "ELECTRON_RUN_AS_NODE": "1"},
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), 20)
+            thread = json.loads(out or b"{}").get("thread") or {}
+            self._t3_kind_cache = thread.get("relationshipToParent") == "subagent"
+        except Exception:
+            logger.debug("T3 delegate detection failed", exc_info=True)
+        return self._t3_kind_cache
+
     @gateway_errors
     async def new_session(self, cwd, mcp_servers=None, **kwargs):
         client = await self._client()
@@ -373,10 +401,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         flags = env_launch_flags(self._environ)
         if flags.get("safe_mode") or flags.get("ignore_user_config"):
             flags.update(_bypass_route(self._environ))
+        create_kwargs = {"t3_delegated": True} if await self._t3_delegated() else {}
         snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
             source="acp", cwd=_translate_acp_cwd(cwd),
             editor={"mcp_servers": self._mcp_specs(mcp_servers),
-                    "edit_approval_policy": "ask"}, **flags)
+                    "edit_approval_policy": "ask"}, **flags, **create_kwargs)
         session_id = snapshot["session_id"]
         await self._adopt(session_id, snapshot)
         if mcp_servers:
