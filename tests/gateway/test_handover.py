@@ -8,60 +8,54 @@ import os
 import socket
 import subprocess
 import sys
-import types
+import threading
 
 import pytest
 
 from gateway import handover, systemd_notify
 
 
-class _AgentCfg:
-    blue_green_restart = True
-
-
-class _Cfg:
-    agent = _AgentCfg()
-
-
-class _CfgOff:
-    agent = types.SimpleNamespace(blue_green_restart=False)
-
-
 def _clear_env(monkeypatch):
     for key in (handover.HANDOVER_ENV, handover.PARENT_PID_ENV, handover.PARENT_START_ENV,
                 "NOTIFY_SOCKET"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(handover, "_parsed_context", None)
 
 
-def test_env_roundtrip(monkeypatch):
+def test_env_roundtrip_and_scrub(monkeypatch):
+    _clear_env(monkeypatch)
     monkeypatch.setenv(handover.HANDOVER_ENV, "1")
     monkeypatch.setenv(handover.PARENT_PID_ENV, str(os.getpid() + 12345))
     monkeypatch.delenv(handover.PARENT_START_ENV, raising=False)
     ctx = handover.handover_from_env()
     assert ctx is not None and ctx.parent_pid == os.getpid() + 12345
     assert ctx.parent_start_ticks is None
+    # Parsed-and-scrubbed: the authority must not leak to this process's own children, and
+    # bootstrap's second parse returns the cached context.
+    assert os.environ.get(handover.HANDOVER_ENV) is None
+    assert handover.handover_from_env() is ctx
     env = handover.successor_env()
     assert env[handover.HANDOVER_ENV] == "1"
-    # successor_env() stamps the CALLER as the parent; from this process that is self -> rejected.
-    assert handover.handover_from_env() is None
 
 
 def test_env_rejects_self_and_missing(monkeypatch):
     _clear_env(monkeypatch)
     assert handover.handover_from_env() is None
+    monkeypatch.setattr(handover, "_parsed_context", None)
     monkeypatch.setenv(handover.HANDOVER_ENV, "1")
     monkeypatch.setenv(handover.PARENT_PID_ENV, str(os.getpid()))
     assert handover.handover_from_env() is None  # predecessor cannot be ourselves
+    monkeypatch.setattr(handover, "_parsed_context", None)
     monkeypatch.setenv(handover.PARENT_PID_ENV, "not-a-pid")
     assert handover.handover_from_env() is None
 
 
 def test_enabled_gate(monkeypatch):
-    _clear_env(monkeypatch)
-    assert handover.enabled(_Cfg()) is False  # no NOTIFY_SOCKET -> cannot switch MainPID
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    assert handover.enabled(False) is False  # no NOTIFY_SOCKET -> cannot switch MainPID
     monkeypatch.setenv("NOTIFY_SOCKET", "/run/user/1/notify")
-    assert handover.enabled(_Cfg()) is True
-    assert handover.enabled(_CfgOff()) is False
+    assert handover.enabled(True) is True
+    assert handover.enabled(False) is False
 
 
 def test_notify_mainpid_payload(tmp_path):
@@ -79,50 +73,80 @@ def test_notify_mainpid_payload(tmp_path):
         assert systemd_notify.notify_mainpid(1) is False
 
 
-def test_wait_successor_ready_pid_match(tmp_path):
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock_path = tmp_path / "gateway.sock"
-    server.bind(str(sock_path))
-    server.listen(1)
+def _serve_identify(server, pid, state, replies=64):
+    server.setblocking(True)
 
+    def serve():
+        for _ in range(replies):
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                conn.recv(4096)
+                conn.sendall(json.dumps({"ok": True, "result": {"pid": pid, "state": state}}).encode() + b"\n")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_wait_successor_ready_requires_ready_state(tmp_path, monkeypatch):
+    sock_path = tmp_path / "gateway.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(8)
     successor_pid = os.getpid() + 777
-
-    async def serve_once():
-        conn, _ = server.accept()
-        with conn:
-            conn.recv(4096)
-            conn.sendall(json.dumps({"ok": True, "result": {"pid": successor_pid}}).encode() + b"\n")
-
-    loop = asyncio.new_event_loop()
+    thread = _serve_identify(server, successor_pid, "ready")
+    monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.05)
+    monkeypatch.setattr("gateway.control_socket.resolve_client_socket_path", lambda home: sock_path)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        serve_task = loop.run_in_executor(None, serve_once)
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(handover, "_POLL_INTERVAL_S", 0.05)
-            mp.setattr("gateway.control_socket.resolve_client_socket_path", lambda home: sock_path)
+        loop = asyncio.new_event_loop()
+        try:
             ready = loop.run_until_complete(
-                asyncio.wait_for(handover.wait_successor_ready(successor_pid, timeout=5.0), 8))
-        assert ready is True
-        serve_task.result()
+                asyncio.wait_for(handover.wait_successor_ready(proc, timeout=5.0), 8))
+            assert ready is True
+        finally:
+            loop.close()
     finally:
-        loop.close()
+        proc.kill()
+        proc.wait()
         server.close()
+        thread.join(timeout=2)
 
 
-def test_wait_successor_ready_timeout(tmp_path, monkeypatch):
+def test_wait_successor_ready_rejects_draining_and_wrong_pid(tmp_path, monkeypatch):
     sock_path = tmp_path / "gateway.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
-    server.listen(1)
-    monkeypatch.setattr("gateway.control_socket.resolve_client_socket_path", lambda home: sock_path)
+    server.listen(8)
+    # A draining blue answering on its own socket must never satisfy the probe.
+    thread = _serve_identify(server, os.getpid(), "draining")
     monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.02)
-    loop = asyncio.new_event_loop()
+    monkeypatch.setattr("gateway.control_socket.resolve_client_socket_path", lambda home: sock_path)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        # Nobody answers with the successor's pid -> bounded False.
-        ready = loop.run_until_complete(handover.wait_successor_ready(os.getpid() + 999, timeout=0.2))
-        assert ready is False
+        loop = asyncio.new_event_loop()
+        try:
+            ready = loop.run_until_complete(handover.wait_successor_ready(os.getpid() + 999, timeout=0.3))
+            assert ready is False
+        finally:
+            loop.close()
     finally:
-        loop.close()
+        proc.kill()
+        proc.wait()
         server.close()
+        thread.join(timeout=2)
+
+
+def test_terminate_successor_fallback():
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    handover.terminate_successor(child)
+    assert child.poll() is not None
+    already = subprocess.Popen([sys.executable, "-c", "pass"])
+    already.wait()
+    handover.terminate_successor(already)  # no-op on an exited child
 
 
 def test_arm_after_predecessor_exit(monkeypatch):

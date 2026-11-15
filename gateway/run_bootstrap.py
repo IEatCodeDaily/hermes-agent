@@ -371,13 +371,9 @@ async def _start_gateway_start_control_socket(runner):
             # Hosted-room transports install onto this listener; bind it here so every launcher
             # that starts the control socket (not only start_gateway) exposes it.
             runner.session_control_server = _control_server
-            from gateway import handover as _handover
-            if _handover.handover_from_env() is not None:
-                # Green is serving: point systemd's MainPID here so blue's exit (still draining
-                # its established connections) does not trigger Restart=always behind us.
-                from gateway import systemd_notify
-                if systemd_notify.notify_mainpid(os.getpid()):
-                    logger.info("Blue-green handover: successor (PID %d) took over as MainPID", os.getpid())
+            # NOTE: a handover successor does NOT notify MAINPID itself — under NotifyAccess=main
+            # systemd drops notify messages from any pid but the current main. Blue sends the
+            # switch after green reports ready (gateway.run_shutdown.request_restart).
     except Exception as _cs_exc:
         logger.error("Control socket startup failed; the gateway cannot start without it: %s", _cs_exc)
         _control_server = None
@@ -831,8 +827,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _enable_multiplex_log_routing(runner.config)
         # ``--replace`` is explicit startup authority, not a durable reconnect policy: GatewayRunner scopes
         # it to cold adapter connects and clears it before the background reconnect watcher starts.
-        # A blue-green handover successor carries the same authority over its predecessor.
-        runner._platform_lock_takeover_on_start = bool(replace) or _handover_ctx is not None
+        # Deliberately NOT given to a blue-green handover successor: takeover SIGTERMs the holder,
+        # which would kill blue mid-drain. Green's adapters fail the lock while blue holds it and
+        # reconnect once blue's stop releases it.
+        runner._platform_lock_takeover_on_start = bool(replace)
 
         # Unexpected signals exit non-zero so service managers revive us; planned stops write a marker first.
         _signal_initiated_shutdown = [False]
