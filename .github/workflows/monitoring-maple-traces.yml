@@ -1,0 +1,70 @@
+name: monitoring-maple-traces
+
+# Runs ONLY on this branch: focused gate for the Maple OTel agent-trace work
+# (tool_origin attribution through the existing agent-trace plane; export
+# target stays operator-configured). The repo's own full-repo CI also fires
+# on the PR.
+on:
+  push:
+    branches: [feat/monitoring-maple-traces]
+permissions:
+  contents: read
+concurrency:
+  group: monitoring-maple-traces
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Python 3.14 (.python-version)
+        run: uv python install 3.14
+
+      - name: "Private PM environment (canonical command; setup inputs modified: 4 UV_CONCURRENT caps = 1)"
+        env:
+          UV_CONCURRENT_DOWNLOADS: '1'
+          UV_CONCURRENT_BUILDS: '1'
+          UV_CONCURRENT_INSTALLS: '1'
+          UV_CONCURRENT_CACHE_READS: '1'
+        run: |
+          PY="$(uv python find 3.14)"
+          "$PY" -m pm.build_env --source . --out ci --group dev --group test --python "$PY"
+
+      - name: Focused monitoring regressions (must PASS)
+        env:
+          TZ: UTC
+          LANG: C.UTF-8
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          mkdir -p "$HERMES_HOME"
+          HERMES_PYTHON="$PWD/ci/bin/python" bash scripts/run_tests.sh \
+            tests/monitoring/test_agent_traces.py \
+            tests/monitoring/test_otlp_exporter.py \
+            tests/monitoring/test_emitter.py \
+            tests/monitoring/test_export_redaction.py \
+            tests/agent/test_trace_producers.py \
+            tests/agent/test_trace_admitted_runner.py \
+            --file-retries 0 --file-timeout 240 -j 2 -q 2>&1 | tee monitoring-traces.log
+
+      - name: Gate on the focused result
+        run: |
+          grep -E "passed" monitoring-traces.log
+          ! grep -qE "[1-9][0-9]* failed" monitoring-traces.log
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: monitoring-traces-evidence
+          path: monitoring-traces.log
+          if-no-files-found: warn
