@@ -30,15 +30,16 @@ without it the handover is refused and restarts keep the classic drain-exit shap
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
 import os
 import shlex
-import signal
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,88 @@ PARENT_START_ENV = "HERMES_GATEWAY_HANDOVER_PARENT_START_TICKS"
 READY_TIMEOUT_S = 20.0
 FALLBACK_TERMINATE_S = 10.0
 # Blue's drain budget already bounds its stop; this is only a safety net for arming the
-# deferred PID-record claim, and arming late is safe (blue's own exit path also cleans up).
+# standby wait, and an overdue wait is safe (blue's exit path also cleans up).
 PREDECESSOR_EXIT_TIMEOUT_S = 1800.0
 _POLL_INTERVAL_S = 0.25
 
 _parsed_context: Optional["HandoverContext"] = None
+
+
+def standby_marker_path(parent_pid: int) -> str:
+    """Green writes this after interpreter/config pre-warm; blue polls for it before the
+    MAINPID switch. One file per predecessor pid, in HERMES_HOME (same trust domain as the
+    PID record), so a stale marker can never vouch for a recycled pid."""
+    from hermes_constants import get_hermes_home
+    return str(Path(get_hermes_home()) / f"gateway.handover-standby.{os.getpid()}.{parent_pid}.tmp")
+
+
+def write_standby_marker(parent_pid: int) -> bool:
+    """Green side: pre-warm done, predecessor-wait armed. Consumed by green after takeover."""
+    try:
+        path = standby_marker_path(parent_pid)
+        with open(path, "w") as f:
+            f.write(json.dumps({"successor_pid": os.getpid(), "parent_pid": parent_pid}))
+        os.chmod(path, 0o600)
+        return True
+    except OSError:
+        return False
+
+
+def clear_standby_marker(parent_pid: int) -> None:
+    from hermes_constants import get_hermes_home
+    with contextlib.suppress(OSError):
+        os.unlink(standby_marker_path(parent_pid))
+
+
+def poll_standby_marker(parent_pid: int) -> Optional[int]:
+    """Blue side: successor pid if its standby marker is present, else None."""
+    from hermes_constants import get_hermes_home
+    path = Path(get_hermes_home()) / f"gateway.handover-standby.*.{parent_pid}.tmp"
+    matches = sorted(Path(get_hermes_home()).glob(path.name))
+    for match in matches:
+        try:
+            payload = json.loads(match.read_text())
+            pid = int(payload.get("successor_pid", 0))
+        except (OSError, ValueError):
+            continue
+        if pid > 0:
+            return pid
+    return None
+
+
+async def wait_successor_standby(proc: subprocess.Popen, timeout: float = READY_TIMEOUT_S) -> bool:
+    """Blue side: poll for green's standby marker (pre-warm done, watching the predecessor).
+
+    Green runs its ownership bootstrap only AFTER blue exits, so standby — not a bound
+    control socket — is the earliest trustworthy signal. Once green confirms standby it is
+    also feeding the watchdog, which is what makes an early MAINPID switch safe.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if proc.poll() is not None:
+            logger.warning("Blue-green handover: successor (PID %d) exited during startup", proc.pid)
+            return False
+        if poll_standby_marker(proc.pid) == proc.pid:
+            return True
+        await asyncio.sleep(_POLL_INTERVAL_S)
+    return False
+
+
+async def feed_watchdog_until_predecessor_exit(ctx: HandoverContext) -> None:
+    """Green side: pet systemd's watchdog while standing by (green may already be MainPID
+    if blue promoted it at standby-confirm; a non-feeding main gets SIGABRTed)."""
+    from gateway.systemd_notify import notify, watchdog_interval_seconds
+    interval = watchdog_interval_seconds()
+    if not interval:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + PREDECESSOR_EXIT_TIMEOUT_S
+    while loop.time() < deadline:
+        notify("WATCHDOG=1")
+        if not predecessor_alive(ctx):
+            return
+        await asyncio.sleep(max(1.0, interval / 2))
 
 
 def enabled(flag: bool) -> bool:
@@ -151,55 +229,6 @@ def spawn_successor() -> Optional[subprocess.Popen]:
     return proc
 
 
-def _identify_pid_and_state(socket_path) -> Optional[tuple[int, str]]:
-    """One public ``identify`` round-trip; (answering pid, descriptor state) or None."""
-    import socket as _socket
-    try:
-        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
-            sock.settimeout(1.5)
-            sock.connect(str(socket_path))
-            sock.sendall(json.dumps({"id": 1, "protocol": 1, "verb": "identify"}).encode() + b"\n")
-            with sock.makefile("rb") as reader:
-                line = reader.readline(4096)
-        payload = json.loads(line.decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return None
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        return None
-    pid = result.get("pid")
-    state = result.get("state")
-    if not isinstance(pid, int) or pid <= 0 or not isinstance(state, str):
-        return None
-    return pid, state
-
-
-async def wait_successor_ready(proc: subprocess.Popen, timeout: float = READY_TIMEOUT_S) -> bool:
-    """Blue side: poll until the successor ITSELF answers identify in the ready state.
-
-    Blue may still answer until green binds the socket name, and a bound-but-starting
-    green answers ``state != 'ready'`` — neither counts. Blocking socket I/O runs in a
-    thread so the event loop (streaming, adapters, in-flight turns) never stalls.
-    """
-    from gateway.control_socket import resolve_client_socket_path
-    from hermes_constants import get_hermes_home
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if proc.poll() is not None:
-            logger.warning("Blue-green handover: successor (PID %d) exited during startup", proc.pid)
-            return False
-        path = resolve_client_socket_path(get_hermes_home())
-        if path is not None:
-            answer = await asyncio.to_thread(_identify_pid_and_state, path)
-            if answer is not None and answer[0] == proc.pid and answer[1] == "ready":
-                return True
-        await asyncio.sleep(_POLL_INTERVAL_S)
-    return False
-
-
 def terminate_successor(proc: subprocess.Popen) -> None:
     """Blue side: a successor that was never promoted must not outlive the fallback."""
     if proc.poll() is not None:
@@ -231,66 +260,8 @@ async def arm_after_predecessor_exit(
             break
         await asyncio.sleep(_POLL_INTERVAL_S)
     else:
-        logger.warning("Predecessor (PID %d) still alive after %.0fs; claiming deferred records anyway",
+        logger.warning("Predecessor (PID %d) still alive after %.0fs; proceeding anyway",
                        ctx.parent_pid, timeout_s)
     outcome = on_exit()
     if inspect.isawaitable(outcome):
         await outcome
-
-
-def _self_stop() -> None:
-    """Stop this gateway through its own signal path (clean drain, supervisor revives)."""
-    os.kill(os.getpid(), signal.SIGTERM)
-
-
-def _claim_pid_record(ctx: HandoverContext) -> None:
-    """Claim the PID record once the predecessor is gone (the body of the deferred claim).
-
-    A lost claim leaves this process as an unrecorded gateway — fatal by self-stop so the
-    supervisor's next boot takes over cleanly instead of two gateways racing the record.
-    """
-    import atexit
-    from gateway.status import get_process_start_time, get_running_pid, remove_pid_file, write_pid_file
-    recorded = get_running_pid()
-    if recorded is not None and recorded != os.getpid():
-        try:
-            os.kill(recorded, 0)
-            alive = get_process_start_time(recorded) is not None
-        except OSError:
-            alive = False
-        if alive:
-            logger.error("Deferred PID claim skipped: a live gateway (PID %d) holds the record; "
-                         "this successor stops itself", recorded)
-            _self_stop()
-            return
-        logger.warning("Replacing stale predecessor PID record (PID %d)", recorded)
-        remove_pid_file()
-    try:
-        write_pid_file()
-    except FileExistsError as exc:
-        logger.error("Deferred PID claim lost the PID-file race (%s); this successor stops itself", exc)
-        _self_stop()
-        return
-    atexit.register(remove_pid_file)
-    from gateway.run import _claim_host_gateway_role
-    try:
-        # The predecessor held the host role; with its exit the role is free, but claim it
-        # explicitly (force = the handover contract) so host-attach resolution points at us.
-        _claim_host_gateway_role(force=True)
-    except SystemExit as exc:  # the role claim refuses via SystemExit(75) — degrade, not die
-        logger.error("Deferred host-role claim refused after handover: %s", exc)
-    except Exception as exc:  # noqa: BLE001 -- role claim failure must not undo the PID claim
-        logger.error("Deferred host-role claim failed after handover: %s", exc)
-    from hermes_cli.gateway_multiplex_mode import publish_pending_multiplex_decision
-    publish_pending_multiplex_decision()
-    logger.info("Blue-green handover complete: PID record claimed (predecessor PID %d exited)",
-                ctx.parent_pid)
-
-
-def deferred_pid_claim(ctx: HandoverContext) -> None:
-    """Green side: schedule ``_claim_pid_record`` to run once blue exits."""
-
-    async def _run() -> None:
-        await arm_after_predecessor_exit(ctx, lambda: _claim_pid_record(ctx))
-
-    asyncio.get_running_loop().create_task(_run())
