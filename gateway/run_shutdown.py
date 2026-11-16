@@ -1705,7 +1705,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             from gateway import handover as _handover
             if not self._stop_requested_by_signal and _handover.enabled(self._blue_green_restart):
                 handover_child = _handover.spawn_successor()
-                ready = handover_child is not None and await _handover.wait_successor_ready(handover_child)
+                ready = handover_child is not None and await _handover.wait_successor_standby(handover_child)
                 if ready:
                     from gateway import systemd_notify
                     if not systemd_notify.notify_mainpid(handover_child.pid):
