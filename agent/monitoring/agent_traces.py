@@ -472,9 +472,13 @@ class AgentTracePlane:
             oldest = state["turns"].pop(next(iter(state["turns"])))
             self._abandon_turn(oldest, "capacity")
         state["turns"][turn_ref] = {
+            # Root trace per turn: the session span is an internal aggregation that
+            # may outlive the turn (or never export); parenting turns under it
+            # hides the whole trace from entry-point-indexed trace search.
+            # Session correlation rides on gen_ai.conversation.id (all spans).
             "span": self._start_span(
                 "agent.turn",
-                state.get("session_span"),
+                None,
                 {
                     "model_class": ev.get("model_class"),
                     "model_id": ev.get("model_id"),
