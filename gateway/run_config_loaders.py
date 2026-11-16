@@ -381,6 +381,12 @@ class GatewayConfigLoadersMixin:
             logger.warning("Invalid %s '%s', using default %.0fs", cfg_key, raw, default)
 
     @classmethod
+    def _load_blue_green_restart(cls) -> bool:
+        """Blue-green restart handover opt-in (successor-first restart; default off)."""
+        raw = cls._env_or_cfg_str("HERMES_BLUE_GREEN_RESTART", "agent", "blue_green_restart")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
     def _load_restart_drain_timeout(cls) -> float:
         """Graceful gateway restart/stop drain timeout in seconds."""
         raw = cls._env_or_cfg_str("HERMES_RESTART_DRAIN_TIMEOUT", "agent", "restart_drain_timeout")

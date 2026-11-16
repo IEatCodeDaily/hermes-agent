@@ -23,6 +23,7 @@ class GatewayRuntimeInitMixin:
         self._human_delay = self._human_delay_from_config(_load_gateway_config())
         self._human_delay_by_profile: Dict[str, Optional[tuple[int, int]]] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        self._blue_green_restart = self._load_blue_green_restart()
         # Live launchd ``ExitTimeOut`` for this job (None when not launchd-owned). Read once at
         # boot — launchd fixes it at load — and applied only to signal-driven stops, which are the
         # only stops launchd times. See _load_launchd_exit_timeout().

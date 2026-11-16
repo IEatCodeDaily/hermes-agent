@@ -28,6 +28,13 @@ def notify(message: str) -> bool:
         return False
 
 
+def notify_mainpid(pid: int) -> bool:
+    """Point systemd's MainPID at ``pid`` (Type=notify units). The predecessor's exit then
+    looks like routine cgroup cleanup instead of a MainPID crash, so ``Restart=always``
+    does not respawn the unit behind the successor's back."""
+    return notify(f"MAINPID={pid}")
+
+
 def watchdog_interval_seconds() -> float | None:
     try:
         interval = float(os.environ.get("WATCHDOG_USEC", "") if _notify_socket() else "") / 1e6

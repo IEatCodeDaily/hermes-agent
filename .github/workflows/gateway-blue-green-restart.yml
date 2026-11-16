@@ -1,0 +1,70 @@
+name: gateway-blue-green-restart
+
+# Runs ONLY on this branch: focused gate for the blue-green restart handover
+# (successor-first restart with sd_notify MainPID switch; falls back to the
+# classic drain-exit restart when green is not ready). The repo's own
+# full-repo CI also fires on the PR.
+on:
+  push:
+    branches: [feat/gateway-blue-green-restart]
+permissions:
+  contents: read
+concurrency:
+  group: gateway-blue-green-restart
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Python 3.14 (.python-version)
+        run: uv python install 3.14
+
+      - name: "Private PM environment (canonical command; setup inputs modified: 4 UV_CONCURRENT caps = 1)"
+        env:
+          UV_CONCURRENT_DOWNLOADS: '1'
+          UV_CONCURRENT_BUILDS: '1'
+          UV_CONCURRENT_INSTALLS: '1'
+          UV_CONCURRENT_CACHE_READS: '1'
+        run: |
+          PY="$(uv python find 3.14)"
+          "$PY" -m pm.build_env --source . --out ci --group dev --group test --python "$PY"
+
+      - name: Focused handover regressions (must PASS)
+        env:
+          TZ: UTC
+          LANG: C.UTF-8
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          mkdir -p "$HERMES_HOME"
+          HERMES_PYTHON="$PWD/ci/bin/python" bash scripts/run_tests.sh \
+            tests/gateway/test_handover.py \
+            --file-retries 0 --file-timeout 240 -j 2 -q 2>&1 | tee blue-green-handover.log
+
+      - name: Gate on the focused result
+        run: |
+          grep -E "passed" blue-green-handover.log
+          ! grep -qE "[1-9][0-9]* failed" blue-green-handover.log
+
+      - name: Byte-compile the touched modules
+        run: |
+          ci/bin/python -m py_compile gateway/handover.py gateway/systemd_notify.py \
+            gateway/run_bootstrap.py gateway/run_shutdown.py hermes_cli/config_defaults.py
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blue-green-handover-evidence
+          path: blue-green-handover.log
+          if-no-files-found: warn

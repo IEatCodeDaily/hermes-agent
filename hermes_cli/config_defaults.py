@@ -109,6 +109,11 @@ DEFAULT_CONFIG = {
         # TimeoutStopSec or risk SIGKILL mid-cleanup; for /restart prefer restart_after_turn_timeout
         # so turns finish BEFORE stop().
         "restart_drain_timeout": 0,
+        # Blue-green restart: the successor gateway boots before the predecessor drains, new
+        # sessions land on it immediately, and sd_notify(MAINPID=...) keeps Restart=always
+        # quiet. Requires a Type=notify unit (NOTIFY_SOCKET); otherwise restarts keep the
+        # classic drain-exit shape.
+        "blue_green_restart": False,
         # Floor under the stop()/drain wait (seconds) for cron jobs and api_server runs. Interrupted
         # chat turns resume on the next message, but an interrupted cron run is recorded as a
         # permanent failure and an interrupted /v1 run fails its waiting caller, so neither may

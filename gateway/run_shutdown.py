@@ -1697,9 +1697,35 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._mark_api_runs_shutdown_requested()
 
         async def _run_restart() -> None:
+            # Blue-green handover: the successor boots FIRST, so new sessions land on it while
+            # blue keeps serving established connections through its drain. Blue sends the
+            # MAINPID switch only after green reports ready (NotifyAccess=main drops green's
+            # own notify), and falls back to the classic drain-exit restart otherwise.
+            handover_child: subprocess.Popen | None = None
+            from gateway import handover as _handover
+            if not self._stop_requested_by_signal and _handover.enabled(self._blue_green_restart):
+                handover_child = _handover.spawn_successor()
+                ready = handover_child is not None and await _handover.wait_successor_ready(handover_child)
+                if ready:
+                    from gateway import systemd_notify
+                    if not systemd_notify.notify_mainpid(handover_child.pid):
+                        logger.warning("Blue-green handover: MAINPID notify failed (no systemd notify "
+                                       "socket); falling back to the drain-exit restart")
+                        ready = False
+                if ready:
+                    self._handover_promoted = True
+                else:
+                    logger.warning("Blue-green handover did not become ready (pid=%s); falling back "
+                                   "to the drain-exit restart", getattr(handover_child, "pid", None))
+                    if handover_child is not None:
+                        await asyncio.to_thread(_handover.terminate_successor, handover_child)
+                    handover_child = None
+                self._handover_child = handover_child
             await self._await_active_work_before_restart()
             # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
-            if detached:
+            # Never when the handover succeeded: systemd's MainPID is already the successor, and a
+            # post-exit `gateway restart` would bounce the new gateway for nothing.
+            if detached and handover_child is None:
                 with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
                     await self._launch_detached_restart_command()
             await asyncio.sleep(0.05)
@@ -2244,6 +2270,13 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         from gateway.run import GatewayRunner
+        # A handover successor never promoted to MainPID (signal stop during the handover
+        # window, or a fallback race) must not outlive this stop as a duplicate gateway.
+        _handover_child = getattr(self, "_handover_child", None)
+        if _handover_child is not None and not getattr(self, "_handover_promoted", False):
+            from gateway import handover as _handover_mod
+            await asyncio.to_thread(_handover_mod.terminate_successor, _handover_child)
+            self._handover_child = None
         # getattr-guard: shutdown-path tests build bare runners via object.__new__ that lack the
         # liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
