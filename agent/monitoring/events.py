@@ -133,6 +133,7 @@ class AgentTurnStartEvent(_MonitoringEvent):
     model_class: str = ""  # provider-class label only, no base_url/keys
     ts_ns: int = field(default_factory=time.time_ns)
     model_id: Optional[str] = None  # actual model identifier, never inferred from class
+    input_messages: Optional[str] = None  # capture_content only: scrubbed gen_ai JSON
 
 
 @dataclass(slots=True)
@@ -152,6 +153,8 @@ class AgentToolExecEvent(_MonitoringEvent):
     # Dispatch origin: "native" or "mcp:<server>" (Executor tools arrive as
     # mcp:executor). Name-derived, content-free; appended, never reordered.
     tool_origin: Optional[str] = None
+    tool_arguments: Optional[str] = None  # capture_content only (start)
+    tool_result: Optional[str] = None  # capture_content only (end)
 
 
 @dataclass(slots=True)
@@ -173,6 +176,7 @@ class AgentTurnEndEvent(_MonitoringEvent):
     ts_ns: int = field(default_factory=time.time_ns)
     model_id: Optional[str] = None
     prompt_occupancy_tokens: Optional[int] = None
+    output_messages: Optional[str] = None  # capture_content only: scrubbed gen_ai JSON
 
 
 @dataclass(slots=True)

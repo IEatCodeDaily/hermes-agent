@@ -10,14 +10,17 @@ spans when queue drops lose terminals. Exports use the same
 Config (both gates required, OFF by default):
     monitoring.agent_traces.enabled: true
     monitoring.agent_traces.ttl_seconds: 3600
+    monitoring.agent_traces.capture_content: false  # opt-in prompts/replies/tool I/O
     monitoring.export.otlp.{enabled,endpoint,headers_env}
 
 Charter (F4): usage attrs are emitted only when supplied as measured per-turn
-accounting; prompt occupancy is separate, never synthesized as input usage. No prompts, completions, tool args
-or secrets enter this plane: attributes are a fixed allowlist per kind and
-string values pass ``redact_bounded``. GenAI semconv attributes (``gen_ai.*``,
-Development stability) are dual-emitted additively from ``_GENAI_MAP`` —
-content stays OFF.
+accounting; prompt occupancy is separate, never synthesized as input usage. By
+default no prompts, completions, tool args or secrets enter this plane:
+attributes are a fixed allowlist per kind and string values pass
+``redact_bounded``. GenAI semconv attributes (``gen_ai.*``, Development
+stability) are dual-emitted additively from ``_GENAI_MAP``. Content
+(``gen_ai.{input,output}.messages``, ``gen_ai.tool.call.{arguments,result}``)
+egresses only with ``capture_content`` on — secret-scrubbed, size-bounded.
 
 Tests inject ``sink_factory`` returning an ``InMemorySpanExporter`` (F3);
 the OTLP exporter is only constructed when no sink is injected.
@@ -110,6 +113,32 @@ _GENAI_MAP: dict[str, Any] = {
 }
 
 
+# Opt-in content (monitoring.agent_traces.capture_content, OFF by default).
+# Producers attach these pre-serialized, secret-scrubbed, size-bounded JSON
+# strings only while the running plane has capture on (``content_capture_enabled``);
+# the plane copies them verbatim — never into hermes.*.
+_CONTENT_MAP = {
+    "input_messages": "gen_ai.input.messages",
+    "output_messages": "gen_ai.output.messages",
+    "tool_arguments": "gen_ai.tool.call.arguments",
+    "tool_result": "gen_ai.tool.call.result",
+}
+
+
+def _content(attrs: dict[str, Any]) -> dict[str, str]:
+    return {
+        genai_key: attrs[key]
+        for key, genai_key in _CONTENT_MAP.items()
+        if isinstance(attrs.get(key), str) and attrs[key]
+    }
+
+
+def content_capture_enabled() -> bool:
+    """True while a live plane was started with ``capture_content: true``."""
+    plane = _PLANE
+    return plane is not None and not plane._closing and plane._capture_content
+
+
 def _genai_wanted(key: str, value: Any) -> bool:
     """Cache usage attrs are Recommended-when-non-zero; other gen_ai attrs when present."""
     return not (key.startswith("cache_") and value == 0)
@@ -181,6 +210,7 @@ class AgentTracePlane:
             )
             * 1_000_000_000
         )
+        self._capture_content = bool(agent_cfg.get("capture_content"))
         # Open-span registry: session_ref -> {session_span, turns:{turn_ref -> ...}}.
         self._sessions: dict[str, dict[str, Any]] = {}
         # W3C ingress: validated parent span registered before session start.
@@ -374,6 +404,7 @@ class AgentTracePlane:
             else None
         )
         out = _bounded(attrs, _ATTR_ALLOWLIST.get(name, ()))
+        out.update(_content(attrs))
         for genai_key, value in _GENAI_MAP.get(name, {}).items():
             out[genai_key] = value
         if attrs.get("session_ref"):
@@ -392,6 +423,7 @@ class AgentTracePlane:
         span: Any, extra: Optional[dict[str, Any]] = None, ts_ns: Optional[int] = None
     ) -> None:
         out = _bounded(extra or {}, _ATTR_ALLOWLIST.get(span.name, ()))
+        out.update(_content(extra or {}))
         for key, value in out.items():
             span.set_attribute(key, value)
         if "error.type" in out:
@@ -483,6 +515,7 @@ class AgentTracePlane:
                     "model_class": ev.get("model_class"),
                     "model_id": ev.get("model_id"),
                     "session_ref": session_ref,
+                    "input_messages": ev.get("input_messages"),
                 },
                 ts_ns,
             ),
@@ -510,6 +543,7 @@ class AgentTracePlane:
                     {
                         "tool_call_id": call_id,
                         "tool_name": ev.get("tool_name", "unknown"),
+                        "tool_arguments": ev.get("tool_arguments"),
                     },
                     ev.get("ts_ns") or time.time_ns(),
                 )
