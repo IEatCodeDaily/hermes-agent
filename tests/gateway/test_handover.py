@@ -1,4 +1,4 @@
-"""Blue-green handover primitives: env contract, gates, readiness probe, deferred claim."""
+"""Blue-green handover primitives: env contract, gates, standby, guard ordering."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import os
 import socket
 import subprocess
 import sys
-import threading
 
 import pytest
 
@@ -73,71 +72,72 @@ def test_notify_mainpid_payload(tmp_path):
         assert systemd_notify.notify_mainpid(1) is False
 
 
-def _serve_identify(server, pid, state, replies=64):
-    server.setblocking(True)
-
-    def serve():
-        for _ in range(replies):
-            try:
-                conn, _ = server.accept()
-            except OSError:
-                return
-            with conn:
-                conn.recv(4096)
-                conn.sendall(json.dumps({"ok": True, "result": {"pid": pid, "state": state}}).encode() + b"\n")
-
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
-    return thread
+def _write_standby_marker(tmp_path, successor_pid, parent_pid):
+    marker = tmp_path / f"gateway.handover-standby.{successor_pid}.{parent_pid}.tmp"
+    marker.write_text(json.dumps({"successor_pid": successor_pid, "parent_pid": parent_pid}))
+    return marker
 
 
-def test_wait_successor_ready_requires_ready_state(tmp_path, monkeypatch):
-    sock_path = tmp_path / "gateway.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(sock_path))
-    server.listen(8)
-    successor_pid = os.getpid() + 777
-    thread = _serve_identify(server, successor_pid, "ready")
+def test_wait_successor_standby_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.05)
-    monkeypatch.setattr("gateway.control_socket.resolve_client_socket_path", lambda home: sock_path)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    # Green keys the marker by BLUE's pid (this process); a marker keyed by the child's own
+    # pid is what the original poll looked for, so blue never saw a real standby.
+    _write_standby_marker(tmp_path, proc.pid, os.getpid())
     try:
         loop = asyncio.new_event_loop()
         try:
             ready = loop.run_until_complete(
-                asyncio.wait_for(handover.wait_successor_ready(proc, timeout=5.0), 8))
+                asyncio.wait_for(handover.wait_successor_standby(proc, timeout=3.0), 6))
             assert ready is True
         finally:
             loop.close()
     finally:
         proc.kill()
         proc.wait()
-        server.close()
-        thread.join(timeout=2)
 
 
-def test_wait_successor_ready_rejects_draining_and_wrong_pid(tmp_path, monkeypatch):
-    sock_path = tmp_path / "gateway.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(sock_path))
-    server.listen(8)
-    # A draining blue answering on its own socket must never satisfy the probe.
-    thread = _serve_identify(server, os.getpid(), "draining")
+def test_wait_successor_standby_rejects_draining_blue(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.02)
-    monkeypatch.setattr("gateway.control_socket.resolve_client_socket_path", lambda home: sock_path)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         loop = asyncio.new_event_loop()
         try:
-            ready = loop.run_until_complete(handover.wait_successor_ready(os.getpid() + 999, timeout=0.3))
+            # No marker for THIS successor: blue's own identify/answer can never satisfy it.
+            ready = loop.run_until_complete(handover.wait_successor_standby(proc, timeout=0.3))
             assert ready is False
         finally:
             loop.close()
     finally:
         proc.kill()
         proc.wait()
-        server.close()
-        thread.join(timeout=2)
+
+
+def test_wait_successor_standby_dead_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.05)
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    loop = asyncio.new_event_loop()
+    try:
+        # A successor that already exited fails fast (no full-timeout wait).
+        ready = loop.run_until_complete(
+            asyncio.wait_for(handover.wait_successor_standby(proc, timeout=30.0), 5))
+        assert ready is False
+    finally:
+        loop.close()
+
+
+def test_standby_marker_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = os.getpid() + 321
+    assert handover.poll_standby_marker(parent) is None  # nothing written yet
+    assert handover.write_standby_marker(parent) is True
+    assert handover.poll_standby_marker(parent) == os.getpid()
+    handover.clear_standby_marker(parent)
+    assert handover.poll_standby_marker(parent) is None
 
 
 def test_terminate_successor_fallback():
@@ -149,19 +149,55 @@ def test_terminate_successor_fallback():
     handover.terminate_successor(already)  # no-op on an exited child
 
 
-def test_arm_after_predecessor_exit(monkeypatch):
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
-    ctx = handover.HandoverContext(parent_pid=child.pid, parent_start_ticks=None)
-    fired = []
+def test_stand_by_blocks_until_predecessor_exit(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
     monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.02)
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(
-            asyncio.wait_for(handover.arm_after_predecessor_exit(ctx, lambda: fired.append(1)), 10))
-    finally:
-        loop.close()
-    child.wait()
-    assert fired == [1]
+    monkeypatch.setattr(handover, "BOOT_FEED_S", 0.0)
+    blue = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+    ctx = handover.HandoverContext(parent_pid=blue.pid, parent_start_ticks=None)
+    seen = []
+    real_alive = handover.predecessor_alive
+
+    def alive(c):
+        seen.append(handover.poll_standby_marker(blue.pid))  # marker visible to blue while waiting
+        if blue.poll() is not None:
+            return False
+        return real_alive(c)
+    monkeypatch.setattr(handover, "predecessor_alive", alive)
+    handover.stand_by(ctx)
+    assert blue.poll() is not None  # returned only after blue exited
+    assert os.getpid() in seen
+    assert handover.poll_standby_marker(blue.pid) is None  # cleared on takeover
+
+
+def test_run_gateway_stands_by_before_single_owner_guards(monkeypatch):
+    """Regression: the successor hit 'already serves profile' because the standby wait ran
+    inside start_gateway, after run_gateway's host-attach guard had already refused it."""
+    from hermes_cli import gateway as cli_gateway
+    order = []
+    ctx = handover.HandoverContext(parent_pid=os.getpid() + 1, parent_start_ticks=None)
+    monkeypatch.setattr(handover, "handover_from_env", lambda: ctx)
+    monkeypatch.setattr(handover, "stand_by", lambda c: order.append("stand_by"))
+    monkeypatch.setattr(cli_gateway, "_guard_official_docker_root_gateway", lambda: None)
+
+    def attach(**_kw):
+        order.append("attach_guard")
+        raise SystemExit(0)
+    monkeypatch.setattr(cli_gateway, "_attach_to_host_gateway_or_guard", attach)
+    with pytest.raises(SystemExit):
+        cli_gateway.run_gateway()
+    assert order == ["stand_by", "attach_guard"]
+
+
+def test_restart_wait_allows_acp_reattach_reads():
+    from types import SimpleNamespace
+
+    from gateway.drain_control import ws_method_refused_while_draining
+    draining = SimpleNamespace(_draining=True)
+    for method in ("config.get", "session.stats", "session.resume", "session.info"):
+        assert not ws_method_refused_while_draining(draining, method), method
+    assert ws_method_refused_while_draining(draining, "config.set")
 
 
 def test_predecessor_alive_pid_reuse_guard(monkeypatch):
@@ -174,47 +210,3 @@ def test_predecessor_alive_pid_reuse_guard(monkeypatch):
     finally:
         child.kill()
         child.wait()
-
-
-def _patch_claim_status(monkeypatch, recorded_pid, recorded_alive, writes):
-    import gateway.status as status
-    monkeypatch.setattr(status, "get_running_pid", lambda *a, **k: recorded_pid)
-    if recorded_alive:
-        monkeypatch.setattr(status, "get_process_start_time", lambda pid: 12345)
-
-        def _kill(pid, sig):
-            return None
-    else:
-        def _kill(pid, sig):
-            raise ProcessLookupError()
-    monkeypatch.setattr(os, "kill", _kill)
-    monkeypatch.setattr(status, "write_pid_file", lambda: writes.append(1))
-    monkeypatch.setattr(status, "remove_pid_file", lambda: writes.append("removed"))
-    import hermes_cli.gateway_multiplex_mode as gmm
-    monkeypatch.setattr(gmm, "publish_pending_multiplex_decision", lambda: None)
-    import gateway.run as run_mod
-    monkeypatch.setattr(run_mod, "_claim_host_gateway_role", lambda force=False: None)
-
-
-def test_claim_skips_live_owner(monkeypatch):
-    writes: list = []
-    _patch_claim_status(monkeypatch, recorded_pid=4321, recorded_alive=True, writes=writes)
-    ctx = handover.HandoverContext(parent_pid=os.getpid() + 555, parent_start_ticks=None)
-    handover._claim_pid_record(ctx)
-    assert writes == []  # a live recorded gateway blocks the claim
-
-
-def test_claim_replaces_stale_owner(monkeypatch):
-    writes: list = []
-    _patch_claim_status(monkeypatch, recorded_pid=4321, recorded_alive=False, writes=writes)
-    ctx = handover.HandoverContext(parent_pid=os.getpid() + 555, parent_start_ticks=None)
-    handover._claim_pid_record(ctx)
-    assert writes == ["removed", 1]
-
-
-def test_claim_when_record_free(monkeypatch):
-    writes: list = []
-    _patch_claim_status(monkeypatch, recorded_pid=None, recorded_alive=False, writes=writes)
-    ctx = handover.HandoverContext(parent_pid=os.getpid() + 555, parent_start_ticks=None)
-    handover._claim_pid_record(ctx)
-    assert writes == [1]

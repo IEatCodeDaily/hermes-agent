@@ -70,6 +70,9 @@ RESTART_WAIT_WS_METHODS = frozenset({
     "ping", "runtime.describe", "session.resume", "session.detach", "session.events.since",
     "session.info", "session.list", "prompt.submit", "prompt.receipt", "session.interrupt",
     "approval.pending", "approval.received", "approval.respond", "clarify.respond", "clarify.lock",
+    # Reads an ACP editor's reattach (load_session) needs before it answers; refusing them
+    # failed every editor reconnect for the whole after-turn wait.
+    "config.get", "session.stats",
 })
 
 

@@ -798,14 +798,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
     # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
     # owner over already freed the lock with that process.
-    # A blue-green handover successor defers the claim instead: the predecessor owns the record
-    # until it exits, and the deferred task (armed after the control socket serves) takes it over.
-    from gateway import handover as _handover
-    _handover_ctx = _handover.handover_from_env()
-    if _handover_ctx is not None:
-        logger.info("Blue-green handover: this boot succeeds gateway PID %d", _handover_ctx.parent_pid)
-        _handover.deferred_pid_claim(_handover_ctx)
-    elif not _start_gateway_claim_pid_file(force=force):
+    # Blue-green handover successors stand by in ``run_gateway`` (before every guard), so by
+    # here the predecessor is gone and this is an ordinary claim.
+    if not _start_gateway_claim_pid_file(force=force):
         release_gateway_runtime_lock()
         return False
 
