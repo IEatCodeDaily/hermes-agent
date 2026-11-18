@@ -1,4 +1,4 @@
-"""Blue-green handover primitives: env contract, gates, readiness probe, deferred claim."""
+"""Blue-green handover primitives: env contract, gates, standby, guard ordering."""
 
 from __future__ import annotations
 
@@ -82,8 +82,9 @@ def test_wait_successor_standby_marker(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.05)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    parent = proc.pid + 1
-    _write_standby_marker(tmp_path, proc.pid, parent)
+    # Green keys the marker by BLUE's pid (this process); a marker keyed by the child's own
+    # pid is what the original poll looked for, so blue never saw a real standby.
+    _write_standby_marker(tmp_path, proc.pid, os.getpid())
     try:
         loop = asyncio.new_event_loop()
         try:
@@ -148,19 +149,55 @@ def test_terminate_successor_fallback():
     handover.terminate_successor(already)  # no-op on an exited child
 
 
-def test_arm_after_predecessor_exit(monkeypatch):
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
-    ctx = handover.HandoverContext(parent_pid=child.pid, parent_start_ticks=None)
-    fired = []
+def test_stand_by_blocks_until_predecessor_exit(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
     monkeypatch.setattr(handover, "_POLL_INTERVAL_S", 0.02)
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(
-            asyncio.wait_for(handover.arm_after_predecessor_exit(ctx, lambda: fired.append(1)), 10))
-    finally:
-        loop.close()
-    child.wait()
-    assert fired == [1]
+    monkeypatch.setattr(handover, "BOOT_FEED_S", 0.0)
+    blue = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+    ctx = handover.HandoverContext(parent_pid=blue.pid, parent_start_ticks=None)
+    seen = []
+    real_alive = handover.predecessor_alive
+
+    def alive(c):
+        seen.append(handover.poll_standby_marker(blue.pid))  # marker visible to blue while waiting
+        if blue.poll() is not None:
+            return False
+        return real_alive(c)
+    monkeypatch.setattr(handover, "predecessor_alive", alive)
+    handover.stand_by(ctx)
+    assert blue.poll() is not None  # returned only after blue exited
+    assert os.getpid() in seen
+    assert handover.poll_standby_marker(blue.pid) is None  # cleared on takeover
+
+
+def test_run_gateway_stands_by_before_single_owner_guards(monkeypatch):
+    """Regression: the successor hit 'already serves profile' because the standby wait ran
+    inside start_gateway, after run_gateway's host-attach guard had already refused it."""
+    from hermes_cli import gateway as cli_gateway
+    order = []
+    ctx = handover.HandoverContext(parent_pid=os.getpid() + 1, parent_start_ticks=None)
+    monkeypatch.setattr(handover, "handover_from_env", lambda: ctx)
+    monkeypatch.setattr(handover, "stand_by", lambda c: order.append("stand_by"))
+    monkeypatch.setattr(cli_gateway, "_guard_official_docker_root_gateway", lambda: None)
+
+    def attach(**_kw):
+        order.append("attach_guard")
+        raise SystemExit(0)
+    monkeypatch.setattr(cli_gateway, "_attach_to_host_gateway_or_guard", attach)
+    with pytest.raises(SystemExit):
+        cli_gateway.run_gateway()
+    assert order == ["stand_by", "attach_guard"]
+
+
+def test_restart_wait_allows_acp_reattach_reads():
+    from types import SimpleNamespace
+
+    from gateway.drain_control import ws_method_refused_while_draining
+    draining = SimpleNamespace(_draining=True)
+    for method in ("config.get", "session.stats", "session.resume", "session.info"):
+        assert not ws_method_refused_while_draining(draining, method), method
+    assert ws_method_refused_while_draining(draining, "config.set")
 
 
 def test_predecessor_alive_pid_reuse_guard(monkeypatch):

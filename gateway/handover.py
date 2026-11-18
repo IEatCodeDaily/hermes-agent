@@ -1,27 +1,17 @@
 """Blue-green gateway restart handover.
 
 Successor-first restart: blue (the running gateway) spawns green (``gateway run``) as a
-child in the same supervisor cgroup. Green serves sessions once its runtime reaches the
-ready state; blue keeps serving its established connections until their turns finish,
-then exits through the existing stop path. The MainPID switch is sent by BLUE (not green:
-``NotifyAccess=main`` drops notify messages from any other pid) and only after green is
-ready and feeding its watchdog, so ``Restart=always`` never fires behind green's back.
+child in the same supervisor cgroup. Green stands by (:func:`stand_by`) BEFORE any ownership
+guard — host attach, duplicate-process, PID record, profile reservation — writes a standby
+marker, feeds systemd's watchdog and blocks until blue exits. Blue sees the marker, sends
+``MAINPID=<green>`` (only the current main may: ``NotifyAccess=main``), drains and exits;
+green then boots through the normal guards, which all see a dead owner. Nothing is
+bypassed and two processes never hold the stores.
 
-Ownership rules that keep the overlap safe:
+Green carries NO platform-lock takeover authority (takeover SIGTERMs the holder).
 
-- The PID record (``gateway.pid``, O_EXCL) stays with blue until blue exits; green claims
-  it from a deferred task that polls for the predecessor's exit. A lost claim is fatal for
-  green (SIGTERM self-stop): an unrecorded gateway must not keep serving.
-- Platform locks: green carries NO takeover authority. Its adapters fail to lock while
-  blue holds them and pick up through the existing reconnect watcher once blue's stop
-  releases them; blue is never signalled by green.
-- Blue sends ``MAINPID=`` only after green's control socket answers ``identify`` with the
-  successor pid AND descriptor state ``ready`` (adapters, cron, housekeeping running).
-
-Known protocol remainder (kept out of v1, flag stays default-off): the profile
-reservation / session-store handoff, control-socket session affinity for turns parked on
-approval/clarify, and fixed-port listeners (api_server) that cannot rebind until blue's
-stop closes them.
+Not covered: serving NEW sessions while blue drains (store custody, approval affinity,
+fixed-port listeners) — blue's drain still refuses them.
 
 Requires a ``Type=notify`` unit (``NOTIFY_SOCKET`` present) so the MainPID switch works;
 without it the handover is refused and restarts keep the classic drain-exit shape.
@@ -31,16 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
 import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +40,12 @@ PARENT_START_ENV = "HERMES_GATEWAY_HANDOVER_PARENT_START_TICKS"
 
 READY_TIMEOUT_S = 20.0
 FALLBACK_TERMINATE_S = 10.0
-# Blue's drain budget already bounds its stop; this is only a safety net for arming the
-# standby wait, and an overdue wait is safe (blue's exit path also cleans up).
-PREDECESSOR_EXIT_TIMEOUT_S = 1800.0
+# Green is MainPID from standby-confirm on, but its own SystemdWatchdog starts only at READY;
+# keep feeding across the post-takeover boot (~30s observed vs WatchdogSec=30s).
+BOOT_FEED_S = 120.0
 _POLL_INTERVAL_S = 0.25
 
-_parsed_context: Optional["HandoverContext"] = None
+_parsed_context: Optional[HandoverContext] = None
 
 
 def standby_marker_path(parent_pid: int) -> str:
@@ -113,26 +103,47 @@ async def wait_successor_standby(proc: subprocess.Popen, timeout: float = READY_
         if proc.poll() is not None:
             logger.warning("Blue-green handover: successor (PID %d) exited during startup", proc.pid)
             return False
-        if poll_standby_marker(proc.pid) == proc.pid:
+        if poll_standby_marker(os.getpid()) == proc.pid:  # green keys its marker by OUR pid
             return True
         await asyncio.sleep(_POLL_INTERVAL_S)
     return False
 
 
-async def feed_watchdog_until_predecessor_exit(ctx: HandoverContext) -> None:
-    """Green side: pet systemd's watchdog while standing by (green may already be MainPID
-    if blue promoted it at standby-confirm; a non-feeding main gets SIGABRTed)."""
-    from gateway.systemd_notify import notify, watchdog_interval_seconds
-    interval = watchdog_interval_seconds()
-    if not interval:
-        return
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + PREDECESSOR_EXIT_TIMEOUT_S
-    while loop.time() < deadline:
+def stand_by(ctx: HandoverContext) -> None:
+    """Green side, before ANY ownership guard: mark standby, keep systemd's watchdog fed and
+    block until the predecessor exits. Sync on purpose — it runs before the event loop.
+
+    No timeout: blue's own restart-handoff watchdog hard-exits it by its deadline, and giving
+    up early would boot green into a live owner's guards (exit -> unit restart -> SIGKILL of
+    blue mid-drain)."""
+    import threading
+    with contextlib.suppress(Exception):
+        # A long drain is not a wedged boot; run_gateway re-arms it after the guards.
+        from hermes_startup_watchdog import disarm_startup_watchdog
+        disarm_startup_watchdog()
+    gone = threading.Event()
+    threading.Thread(target=_feed_watchdog, args=(gone,), daemon=True,
+                     name="gateway-handover-watchdog-feed").start()
+    write_standby_marker(ctx.parent_pid)
+    print(f"⏳ Blue-green handover: standing by until gateway PID {ctx.parent_pid} exits", flush=True)
+    try:
+        while predecessor_alive(ctx):
+            time.sleep(_POLL_INTERVAL_S)
+    finally:
+        clear_standby_marker(ctx.parent_pid)
+        gone.set()
+
+
+def _feed_watchdog(predecessor_gone) -> None:
+    # ponytail: blind feed for BOOT_FEED_S after takeover — systemd cannot see a wedged boot in
+    # that window (the startup watchdog still can); stop on the runner's READY if it matters.
+    from gateway.systemd_notify import notify
+    while not predecessor_gone.wait(1.0):
         notify("WATCHDOG=1")
-        if not predecessor_alive(ctx):
-            return
-        await asyncio.sleep(max(1.0, interval / 2))
+    end = time.monotonic() + BOOT_FEED_S
+    while time.monotonic() < end:
+        notify("WATCHDOG=1")
+        time.sleep(1.0)
 
 
 def enabled(flag: bool) -> bool:
@@ -219,7 +230,7 @@ def spawn_successor() -> Optional[subprocess.Popen]:
     from hermes_cli.gateway import _profile_arg
     full_argv = [*argv, *shlex.split(_profile_arg()), "gateway", "run"]
     try:
-        proc = subprocess.Popen(  # noqa: ASYNC220 -- spawn returns at once; the child outlives this task
+        proc = subprocess.Popen(
             full_argv, env={**os.environ, **successor_env()},
         )
     except OSError as exc:
@@ -244,24 +255,3 @@ def terminate_successor(proc: subprocess.Popen) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-
-
-async def arm_after_predecessor_exit(
-    ctx: HandoverContext,
-    on_exit: Callable[[], Any],
-    timeout_s: float = PREDECESSOR_EXIT_TIMEOUT_S,
-) -> None:
-    """Green side: run ``on_exit`` once the predecessor is gone (its stop path releases the
-    single-owner records). Arms anyway at the timeout — blue's exit path also cleans up."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if not predecessor_alive(ctx):
-            break
-        await asyncio.sleep(_POLL_INTERVAL_S)
-    else:
-        logger.warning("Predecessor (PID %d) still alive after %.0fs; proceeding anyway",
-                       ctx.parent_pid, timeout_s)
-    outcome = on_exit()
-    if inspect.isawaitable(outcome):
-        await outcome

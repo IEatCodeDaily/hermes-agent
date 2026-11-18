@@ -4562,6 +4562,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
     _guard_official_docker_root_gateway()
+    # Blue-green successor: wait out the predecessor BEFORE the single-owner guards below,
+    # which would otherwise see it alive and refuse ("already serves profile").
+    from gateway import handover as _handover
+    if (_handover_ctx := _handover.handover_from_env()) is not None:
+        _handover.stand_by(_handover_ctx)
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)

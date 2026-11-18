@@ -798,19 +798,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
     # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
     # owner over already freed the lock with that process.
-    # Blue-green handover: a standby successor pre-warms (interpreter + config are loaded by
-    # this point), feeds the watchdog, and waits for the predecessor's exit BEFORE the
-    # ownership bootstrap. Every guard below then sees a dead owner instead of a live
-    # sibling — attach, PID record, profile reservation and stores need no bypass.
-    from gateway import handover as _handover
-    _handover_ctx = _handover.handover_from_env()
-    if _handover_ctx is not None:
-        logger.info("Blue-green handover: this boot succeeds gateway PID %d; standing by",
-                    _handover_ctx.parent_pid)
-        _handover.write_standby_marker(_handover_ctx.parent_pid)
-        asyncio.create_task(_handover.feed_watchdog_until_predecessor_exit(_handover_ctx))
-        await _handover.arm_after_predecessor_exit(_handover_ctx, lambda: None)
-        _handover.clear_standby_marker(_handover_ctx.parent_pid)
+    # Blue-green handover successors stand by in ``run_gateway`` (before every guard), so by
+    # here the predecessor is gone and this is an ordinary claim.
     if not _start_gateway_claim_pid_file(force=force):
         release_gateway_runtime_lock()
         return False
