@@ -55,8 +55,53 @@ def _known_label(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() and value.strip().lower() != "unknown" else None
 
 
+# ponytail: fixed per-field cap keeps one span well under the ingest body limit;
+# make it a config knob if 16 KiB truncates transcripts people actually read.
+_CONTENT_LIMIT = 16_000
+
+
+def _capture_on() -> bool:
+    try:
+        from agent.monitoring.agent_traces import content_capture_enabled
+
+        return content_capture_enabled()
+    except Exception:
+        return False
+
+
+def _scrub(value: Any) -> Optional[str]:
+    """Secret-scrubbed, bounded text for opt-in content capture; None when off/empty.
+    Fails closed: ``redact_for_egress`` never returns raw text if it raises."""
+    if value is None or not _capture_on():
+        return None
+    from agent.redact import redact_for_egress
+
+    text = value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+    text = redact_for_egress(text)
+    if len(text) > _CONTENT_LIMIT:
+        text = text[:_CONTENT_LIMIT] + f"…[truncated {len(text) - _CONTENT_LIMIT} chars]"
+    return text or None
+
+
+def _message_text(message: Any) -> Any:
+    """Text of a user message: plain str, or the text parts of a multimodal list."""
+    if isinstance(message, list):
+        parts = [p.get("text") for p in message if isinstance(p, dict) and isinstance(p.get("text"), str)]
+        return "\n".join(parts) or None
+    return message
+
+
+def _messages(role: str, message: Any) -> Optional[str]:
+    """One-message gen_ai.{input,output}.messages JSON (semconv parts shape)."""
+    text = _scrub(_message_text(message))
+    if text is None:
+        return None
+    return json.dumps([{"role": role, "parts": [{"type": "text", "content": text}]}], ensure_ascii=False)
+
+
 def emit_turn_start(
     session_key: str, turn_id: str, model_class: str = "", *, model_id: Optional[str] = None,
+    user_message: Any = None,
 ) -> None:
     try:
         from agent.monitoring.events import AgentTurnStartEvent, pseudonymize_id
@@ -64,6 +109,7 @@ def emit_turn_start(
         _emit(AgentTurnStartEvent(
             session_ref=pseudonymize_id(session_key), turn_ref=pseudonymize_id(turn_id),
             model_class=_known_label(model_class) or "", model_id=_known_label(model_id),
+            input_messages=_messages("user", user_message),
         ))
     except Exception:
         logger.debug("agent-trace turn_start dropped", exc_info=True)
@@ -73,7 +119,7 @@ def emit_turn_end(
     session_key: str, turn_id: str, status: str, *, duration_ms: Optional[int] = None,
     model_class: str = "", model_id: Optional[str] = None,
     last_prompt_tokens: Optional[int] = None, error_class: Optional[str] = None,
-    ts_ns: Optional[int] = None,
+    ts_ns: Optional[int] = None, final_response: Any = None,
 ) -> None:
     try:
         from agent.monitoring.events import AgentTurnEndEvent, pseudonymize_id
@@ -85,6 +131,7 @@ def emit_turn_end(
             status=status, duration_ms=duration_ms, model_class=_known_label(model_class) or "",
             model_id=_known_label(model_id), prompt_occupancy_tokens=occupancy,
             error_class=error_class, ts_ns=ts_ns if ts_ns is not None else time.time_ns(),
+            output_messages=_messages("assistant", final_response),
         ))
     except Exception:
         logger.debug("agent-trace turn_end dropped", exc_info=True)
@@ -117,8 +164,8 @@ def _exception_status(error: BaseException) -> str:
 
 
 class _ToolTrace:
-    def __init__(self, call_id: str, name: str, tool_origin: Optional[str] = None) -> None:
-        self.call_id, self.name, self.tool_origin = call_id, name, tool_origin
+    def __init__(self, call_id: str, name: str, tool_origin: Optional[str] = None, args: Any = None) -> None:
+        self.call_id, self.name, self.tool_origin, self.args = call_id, name, tool_origin, args
         self.started = time.monotonic_ns()
         self.result: Any = None
 
@@ -145,6 +192,8 @@ class _ExecutionTrace:
             turn_ref=pseudonymize_id(self.identity[1]), tool_call_id=tool.call_id,
             tool_name=tool.name, ts_ns=ts_ns, status=status, error_class=error_class,
             tool_origin=tool.tool_origin,
+            tool_arguments=_scrub(tool.args) if phase == "start" else None,
+            tool_result=_scrub(tool.result) if phase == "end" else None,
             duration_ms=(time.monotonic_ns() - tool.started) // 1_000_000 if phase == "end" else None,
         ))
 
@@ -185,11 +234,12 @@ class _ExecutionTrace:
                 model_id=_known_label(result.get("model")),
                 last_prompt_tokens=result.get("last_prompt_tokens"),
                 error_class=type(error).__name__ if error is not None else ("turn_failed" if status == "failed" else None),
+                final_response=result.get("final_response"),
             )
 
 
 @contextmanager
-def trace_execution(agent: Any, session_id: str, turn_id: str):
+def trace_execution(agent: Any, session_id: str, turn_id: str, user_message: Any = None):
     """Admitted synchronous execution only; neither admission wait nor delivery is inside."""
     trace = _ExecutionTrace(agent, session_id, turn_id)
     token = _EXECUTION.set(trace)
@@ -197,7 +247,7 @@ def trace_execution(agent: Any, session_id: str, turn_id: str):
     try:
         emit_session_start(session_id, str(getattr(agent, "platform", "") or "unknown"))
         emit_turn_start(session_id, turn_id, getattr(agent, "provider", "") or "",
-                        model_id=getattr(agent, "model", None))
+                        model_id=getattr(agent, "model", None), user_message=user_message)
         yield trace
     except BaseException as exc:
         error = exc
@@ -213,10 +263,10 @@ def trace_execution(agent: Any, session_id: str, turn_id: str):
 
 
 @contextmanager
-def trace_tool(call_id: str, tool_name: str, tool_origin: Optional[str] = None):
+def trace_tool(call_id: str, tool_name: str, tool_origin: Optional[str] = None, args: Any = None):
     """Wrap only real dispatch; inherited context keeps late workers on their original owner."""
     trace = _EXECUTION.get()
-    tool = _ToolTrace(call_id, tool_name, tool_origin)
+    tool = _ToolTrace(call_id, tool_name, tool_origin, args)
     status, error_class = "completed", None
     if trace is not None:
         with suppress(Exception):  # Optional telemetry cannot prevent real dispatch.

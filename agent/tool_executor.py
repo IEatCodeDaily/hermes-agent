@@ -756,7 +756,7 @@ def _dispatch_authorized_once(
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
         try:
             from gateway.agent_trace_emit import trace_tool
-            with trace_tool(ref.call_id, ref.name, _tool_origin(ref.name)) as tool_trace:
+            with trace_tool(ref.call_id, ref.name, _tool_origin(ref.name), ref.args) as tool_trace:
                 result = _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
                 tool_trace.result = result
                 return result

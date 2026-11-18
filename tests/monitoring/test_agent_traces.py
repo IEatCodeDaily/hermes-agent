@@ -141,7 +141,9 @@ def test_span_tree_hierarchy_and_exactly_once():
     turn = by_name["agent.turn"][0]
     tool = by_name["agent.tool"][0]
     child = by_name["agent.child"][0]
-    assert turn.parent.span_id == session.context.span_id
+    # Turns are trace roots (entry-point search); sessions correlate by conversation id.
+    assert turn.parent is None
+    assert dict(turn.attributes)["gen_ai.conversation.id"] == dict(session.attributes)["gen_ai.conversation.id"]
     assert tool.parent.span_id == turn.context.span_id
     assert child.parent.span_id == turn.context.span_id
     turn_attrs = dict(turn.attributes)
@@ -1084,5 +1086,50 @@ def test_tool_origin_allowlisted_into_span():
         plane.handle({"event": "agent_turn_end", "session_ref": "s", "turn_ref": "t"})
         span, = [s for s in sink.get_finished_spans() if s.name == "agent.tool"]
         assert dict(span.attributes)["hermes.tool_origin"] == "mcp:executor"
+    finally:
+        plane.shutdown()
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_content_capture_is_opt_in_and_scrubbed(monkeypatch, capture):
+    """Real producer path: trace_execution/trace_tool -> emitter events -> plane spans."""
+    import json
+
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    import agent.monitoring.agent_traces as mod
+    from gateway import agent_trace_emit as emit_mod
+
+    config = {"monitoring": {**CONFIG["monitoring"], "agent_traces": {
+        **CONFIG["monitoring"]["agent_traces"], "capture_content": capture}}}
+    sink = InMemorySpanExporter()
+    plane = mod.AgentTracePlane(config, sink_factory=lambda: sink)
+    plane.start()
+    monkeypatch.setattr(mod, "_PLANE", plane)
+    monkeypatch.setattr(emit_mod, "_emit", lambda event: plane.handle(event.to_dict()))
+    secret = "sk-ant-api03-" + "A" * 40
+
+    class Agent:
+        platform, provider, model = "local", "anthropic", "m"
+
+    try:
+        with emit_mod.trace_execution(Agent(), "sess", "turn", f"hello {secret}") as execution:
+            with emit_mod.trace_tool("tc1", "terminal", "native", {"command": "ls", "token": secret}) as tool:
+                tool.result = "file-a\nfile-b"
+            execution.result = {"final_response": "done " + "x" * 20_000}
+        spans = {s.name: dict(s.attributes) for s in sink.get_finished_spans()}
+        turn, tool = spans["agent.turn"], spans["agent.tool"]
+        content_keys = {"gen_ai.input.messages", "gen_ai.output.messages",
+                        "gen_ai.tool.call.arguments", "gen_ai.tool.call.result"}
+        if not capture:
+            assert not content_keys & (set(turn) | set(tool))
+            return
+        assert secret not in json.dumps([turn, tool])
+        inp = json.loads(turn["gen_ai.input.messages"])
+        assert inp[0]["role"] == "user" and inp[0]["parts"][0]["content"].startswith("hello ")
+        out = json.loads(turn["gen_ai.output.messages"])[0]["parts"][0]["content"]
+        assert out.startswith("done ") and "[truncated" in out and len(out) < 16_100
+        assert '"command": "ls"' in tool["gen_ai.tool.call.arguments"]
+        assert tool["gen_ai.tool.call.result"] == "file-a\nfile-b"
     finally:
         plane.shutdown()
